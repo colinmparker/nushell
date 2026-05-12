@@ -748,6 +748,7 @@ fn handle_row_stream(
     metadata: Option<PipelineMetadata>,
 ) -> ShellResult<PipelineData> {
     let cfg = input.get_config();
+    let start_row = metadata.as_ref().map(|m| m.row_offset).unwrap_or(0);
 
     let stream = if let Some(metadata) = metadata {
         let stream = if let PipelineMetadata {
@@ -844,6 +845,7 @@ fn handle_row_stream(
         input.stack.clone(),
         input.cfg,
         cfg,
+        start_row,
     );
     let stream = ByteStream::from_result_iter(
         paginator,
@@ -917,7 +919,16 @@ impl PagingTableCreator {
         stack: Stack,
         table_config: TableConfig,
         config: std::sync::Arc<Config>,
+        start_row: usize,
     ) -> Self {
+        let table_config = if start_row > 0 {
+            // Shift the base index so row numbering resumes where it left off.
+            let mut cfg = table_config;
+            cfg.index = Some(cfg.index.unwrap_or(0) + start_row);
+            cfg
+        } else {
+            table_config
+        };
         PagingTableCreator {
             head,
             stream: stream.into_inner(),

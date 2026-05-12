@@ -178,7 +178,6 @@ impl<I: Iterator> Iterator for InterruptIter<I> {
     type Item = <I as Iterator>::Item;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.signals.wait_if_suspended();
         if self.signals.interrupted() {
             None
         } else {
