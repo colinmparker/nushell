@@ -1,7 +1,7 @@
 #![allow(clippy::byte_char_slices)]
 
 use nu_cmd_base::hook::eval_hook;
-use nu_engine::{eval_block, eval_block_with_early_return};
+use nu_engine::{eval_block, eval_block_with_early_return, wrap_suspendable};
 use nu_parser::{Token, TokenContents, lex, parse, unescape_unquote_string};
 use nu_protocol::{
     PipelineData, ShellError, Span, Value,
@@ -330,6 +330,10 @@ fn evaluate_source(
         }
     }
     stack.deletions.clear();
+
+    // Wrap the output in a SuspendableIter so Ctrl+Z can freeze the pipeline mid-stream
+    // at the REPL boundary. Also clears any stale SIGTSTP flag from a previous pipeline.
+    let pipeline_data = wrap_suspendable(engine_state, pipeline_data);
 
     let no_newline = matches!(&pipeline_data, &PipelineData::ByteStream(..));
     print_pipeline(engine_state, stack, pipeline_data, no_newline)?;

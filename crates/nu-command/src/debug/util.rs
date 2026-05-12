@@ -11,6 +11,7 @@ pub fn extend_record_with_metadata(
         path_columns,
         content_type,
         custom,
+        ..
     }) = metadata
     {
         match data_source {

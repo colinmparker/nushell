@@ -1,14 +1,11 @@
-use std::sync::mpsc::RecvTimeoutError;
-use std::time::Duration;
-
+use nu_engine::FrozenIteratorState;
 use nu_engine::command_prelude::*;
-use nu_engine::{FrozenPipelineState, PipelineProxy, WorkerOutput};
 use nu_protocol::{
     JobId, ListStream, Signals,
     engine::{FrozenJob, Job, ThreadJob},
     process::check_ok,
 };
-use nu_system::{ForegroundWaitStatus, SIGTSTP_FLAG, UnfreezeHandle, kill_by_pid};
+use nu_system::{ForegroundWaitStatus, UnfreezeHandle, kill_by_pid};
 
 #[derive(Clone)]
 pub struct JobUnfreeze;
@@ -100,13 +97,12 @@ fn unfreeze_job(
             description,
             pipeline_state,
         }) => {
-            // Thread-based pipeline jobs are handled directly — they don't go through the
-            // external-process wait loop.
-            if matches!(handle, UnfreezeHandle::Thread { .. }) {
-                return unfreeze_thread_job(state, handle, pipeline_state, span);
+            // Iterator-based pipeline jobs are handled directly.
+            if matches!(handle, UnfreezeHandle::Iterator) {
+                return unfreeze_iterator_job(pipeline_state, span);
             }
 
-            // External process job (pid > 0).
+            // External process job.
             let pid = handle.pid();
 
             if pid > 0
@@ -167,93 +163,22 @@ fn unfreeze_job(
     }
 }
 
-/// Resume a thread-based pipeline job, returning any remaining stream output.
-fn unfreeze_thread_job(
-    state: &EngineState,
-    handle: UnfreezeHandle,
+/// Resume an iterator-based frozen pipeline, returning the remaining stream output.
+///
+/// The returned `ListStream` will be re-wrapped in a `SuspendableIter` at the REPL
+/// boundary (`wrap_suspendable`), so Ctrl+Z works again during resumed printing.
+fn unfreeze_iterator_job(
     pipeline_state: Option<Box<dyn std::any::Any + Send>>,
     _span: Span,
 ) -> Result<PipelineData, ShellError> {
-    // Resume the worker (if it is parked at a cooperative yield point).
-    if let UnfreezeHandle::Thread {
-        ref suspend_state, ..
-    } = handle
-    {
-        suspend_state.resume();
-    }
-
-    // If we have a frozen stream state, reconstruct the proxy and return the remaining output.
-    let frozen_state = pipeline_state
-        .and_then(|b| b.downcast::<FrozenPipelineState>().ok())
+    let frozen = pipeline_state
+        .and_then(|b| b.downcast::<FrozenIteratorState>().ok())
         .map(|b| *b);
 
-    let Some(mut state_data) = frozen_state else {
+    let Some(state) = frozen else {
         return Ok(PipelineData::Empty);
     };
 
-    // Phase 1 freeze: the worker hasn't sent its output message yet.
-    // Poll output_rx to learn whether the result is Immediate (return directly,
-    // preserving the exact PipelineData variant) or Streaming (build a proxy).
-    // Without this, the worker sends WorkerOutput::Immediate on a disconnected
-    // channel and the value is silently lost, causing "empty list".
-    if let Some(output_rx) = state_data.output_rx.take() {
-        loop {
-            match output_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(WorkerOutput::Immediate(result)) => {
-                    return result;
-                }
-                Ok(WorkerOutput::Streaming { span, metadata }) => {
-                    state_data.span = span;
-                    state_data.metadata = metadata.clone();
-                    let proxy =
-                        PipelineProxy::new(state_data, state.jobs.clone(), state.is_interactive);
-                    let stream = ListStream::new(proxy, span, Signals::empty());
-                    return Ok(PipelineData::list_stream(stream, metadata));
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    // Worker exited unexpectedly.
-                    return Ok(PipelineData::Empty);
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    // Check for Ctrl+Z (re-freeze).
-                    if SIGTSTP_FLAG.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                        state_data.suspend_state.suspend();
-                        let _ = state_data
-                            .frozen_rx
-                            .recv_timeout(Duration::from_millis(500));
-                        state_data.output_rx = Some(output_rx);
-                        let handle = UnfreezeHandle::Thread {
-                            suspend_state: state_data.suspend_state.clone(),
-                            interrupt: state_data.interrupt.clone(),
-                        };
-                        let job = Job::Frozen(FrozenJob {
-                            unfreeze: handle,
-                            description: Some("pipeline".into()),
-                            pipeline_state: Some(Box::new(state_data)),
-                        });
-                        let job_id = state.jobs.lock().expect("jobs lock").add_job(job);
-                        if state.is_interactive {
-                            eprintln!("\nJob {} is re-frozen", job_id.get());
-                        }
-                        return Ok(PipelineData::Empty);
-                    }
-                    // Check for Ctrl+C.
-                    if state_data
-                        .interrupt
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        state_data.suspend_state.resume();
-                        return Ok(PipelineData::Empty);
-                    }
-                }
-            }
-        }
-    }
-
-    // Mid-stream freeze: streaming was already underway, build a proxy for remaining values.
-    let span = state_data.span;
-    let metadata = state_data.metadata.clone();
-    let proxy = PipelineProxy::new(state_data, state.jobs.clone(), state.is_interactive);
-    let stream = ListStream::new(proxy, span, Signals::empty());
-    Ok(PipelineData::list_stream(stream, metadata))
+    let stream = ListStream::new(state.inner, state.span, Signals::empty());
+    Ok(PipelineData::list_stream(stream, state.metadata))
 }

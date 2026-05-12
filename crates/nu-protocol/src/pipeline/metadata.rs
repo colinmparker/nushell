@@ -23,6 +23,12 @@ pub struct PipelineMetadata {
     pub content_type: Option<String>,
     #[serde(default)]
     pub custom: Record,
+    /// When rendering this stream as a table, start row numbering from this offset.
+    ///
+    /// Used to resume a frozen pipeline at the correct row number so output is
+    /// indistinguishable from uninterrupted output.
+    #[serde(default)]
+    pub row_offset: usize,
 }
 
 impl PipelineMetadata {
@@ -58,6 +64,7 @@ impl PipelineMetadata {
             path_columns,
             content_type,
             custom,
+            row_offset,
         } = self;
 
         // Transform FilePath to None after collect
@@ -71,6 +78,7 @@ impl PipelineMetadata {
             && path_columns.is_empty()
             && content_type.is_none()
             && custom.is_empty()
+            && row_offset == 0
         {
             None
         } else {
@@ -79,6 +87,7 @@ impl PipelineMetadata {
                 path_columns,
                 content_type,
                 custom,
+                row_offset,
             })
         }
     }
