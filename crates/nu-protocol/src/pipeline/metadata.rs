@@ -23,10 +23,8 @@ pub struct PipelineMetadata {
     pub content_type: Option<String>,
     #[serde(default)]
     pub custom: Record,
-    /// When rendering this stream as a table, start row numbering from this offset.
-    ///
     /// Used to resume a frozen pipeline at the correct row number so output is
-    /// indistinguishable from uninterrupted output.
+    /// identical to uninterrupted output.
     #[serde(default)]
     pub row_offset: usize,
 }

@@ -7,14 +7,11 @@ use nu_protocol::{
 use nu_system::{SIGTSTP_FLAG, UnfreezeHandle};
 
 /// Iterator state preserved across a freeze/resume cycle.
-///
-/// Stored in [`FrozenJob::pipeline_state`] as `Box<dyn Any + Send>`.
-/// On `job unfreeze`, downcast back to `FrozenIteratorState` to reconstitute the stream.
 pub struct FrozenIteratorState {
     pub inner: ValueIterator,
     pub span: Span,
     /// Metadata carries `row_offset` — the number of rows already displayed before this freeze.
-    pub metadata: Option<PipelineMetadata>,
+    pub metadata: PipelineMetadata,
 }
 
 /// A thin wrapper iterator that checks `SIGTSTP_FLAG` before each value pull.
@@ -30,8 +27,7 @@ pub struct SuspendableIter {
     jobs: Arc<Mutex<Jobs>>,
     is_interactive: bool,
     span: Span,
-    metadata: Option<PipelineMetadata>,
-    items_consumed: usize,
+    metadata: PipelineMetadata,
 }
 
 impl SuspendableIter {
@@ -47,8 +43,7 @@ impl SuspendableIter {
             jobs,
             is_interactive,
             span,
-            metadata,
-            items_consumed: 0,
+            metadata: metadata.unwrap_or(PipelineMetadata::default()),
         }
     }
 }
@@ -61,17 +56,10 @@ impl Iterator for SuspendableIter {
         if SIGTSTP_FLAG.swap(false, Ordering::SeqCst) {
             let inner = self.inner.take()?;
 
-            // Carry the row offset forward so resumed output continues numbering correctly.
-            // The base row_offset (from a previous freeze) plus items consumed in this run
-            // gives the total rows already displayed. Always create metadata even if the
-            // original stream had none, so the offset is not lost on unfreeze.
-            let mut frozen_metadata = self.metadata.clone().unwrap_or_default();
-            frozen_metadata.row_offset += self.items_consumed;
-
             let frozen_state = FrozenIteratorState {
                 inner,
                 span: self.span,
-                metadata: Some(frozen_metadata),
+                metadata: self.metadata.clone(),
             };
 
             let job = Job::Frozen(FrozenJob {
@@ -91,7 +79,7 @@ impl Iterator for SuspendableIter {
 
         let value = self.inner.as_mut()?.next();
         if value.is_some() {
-            self.items_consumed += 1;
+            self.metadata.row_offset += 1;
         }
         value
     }
