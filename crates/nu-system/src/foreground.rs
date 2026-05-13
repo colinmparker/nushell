@@ -1,6 +1,7 @@
 use std::sync::{
-    Arc,
-    atomic::{AtomicU32, Ordering},
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    mpsc,
 };
 
 use std::io;
@@ -155,6 +156,73 @@ impl From<std::process::ExitStatus> for ForegroundWaitStatus {
     }
 }
 
+/// Cooperative suspension state for internal (thread-based) pipelines.
+///
+/// When suspended, threads calling [`wait_if_suspended`](Self::wait_if_suspended) will block
+/// until [`resume`](Self::resume) is called. Used by `CommandThread` to park the worker at the
+/// next cooperative yield point (a `signals.check()` or `InterruptIter::next()` call).
+#[derive(Debug)]
+pub struct SuspendState {
+    suspended: AtomicBool,
+    condvar: Condvar,
+    mutex: Mutex<bool>,
+    frozen_tx: Mutex<Option<mpsc::SyncSender<()>>>,
+}
+
+impl SuspendState {
+    pub fn new() -> Self {
+        SuspendState {
+            suspended: AtomicBool::new(false),
+            condvar: Condvar::new(),
+            mutex: Mutex::new(false),
+            frozen_tx: Mutex::new(None),
+        }
+    }
+
+    /// Signal that threads should suspend at their next yield point.
+    pub fn suspend(&self) {
+        self.suspended.store(true, Ordering::SeqCst);
+    }
+
+    /// Resume suspended threads.
+    pub fn resume(&self) {
+        self.suspended.store(false, Ordering::SeqCst);
+        self.condvar.notify_all();
+    }
+
+    /// Returns whether the pipeline is currently requested to suspend.
+    pub fn is_suspended(&self) -> bool {
+        self.suspended.load(Ordering::SeqCst)
+    }
+
+    /// Register a channel to notify the orchestrator when the worker parks.
+    pub fn set_frozen_notifier(&self, tx: mpsc::SyncSender<()>) {
+        *self.frozen_tx.lock().expect("frozen_tx lock") = Some(tx);
+    }
+
+    /// Cooperative yield point. Blocks if suspended; returns immediately otherwise.
+    ///
+    /// When the thread parks, it first notifies the orchestrator via the frozen channel,
+    /// then waits on the condvar until [`resume`](Self::resume) is called.
+    pub fn wait_if_suspended(&self) {
+        if self.suspended.load(Ordering::SeqCst) {
+            if let Some(tx) = self.frozen_tx.lock().expect("frozen_tx lock").as_ref() {
+                let _ = tx.try_send(());
+            }
+            let mut guard = self.mutex.lock().expect("suspend mutex");
+            while self.suspended.load(Ordering::SeqCst) {
+                guard = self.condvar.wait(guard).expect("condvar wait");
+            }
+        }
+    }
+}
+
+impl Default for SuspendState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 pub enum UnfreezeHandle {
     Process {
@@ -164,6 +232,12 @@ pub enum UnfreezeHandle {
     /// A frozen internal pipeline (iterator-based). The actual iterator state is stored
     /// in [`FrozenJob::pipeline_state`] as `Box<dyn Any + Send>`.
     Iterator,
+    /// A frozen internal pipeline (thread-based). The worker thread is parked on the
+    /// condvar in `suspend_state`.
+    Thread {
+        suspend_state: Arc<SuspendState>,
+        interrupt: Arc<AtomicBool>,
+    },
 }
 
 impl UnfreezeHandle {
@@ -187,8 +261,10 @@ impl UnfreezeHandle {
 
                 unix_wait(child_pid)
             }
-            // Iterator-based pipelines are handled directly in job_unfreeze, not here.
-            UnfreezeHandle::Iterator => Ok(ForegroundWaitStatus::Finished(ExitStatus::Exited(0))),
+            // Iterator/Thread-based pipelines are handled directly in job_unfreeze, not here.
+            UnfreezeHandle::Iterator | UnfreezeHandle::Thread { .. } => {
+                Ok(ForegroundWaitStatus::Finished(ExitStatus::Exited(0)))
+            }
         }
     }
 
@@ -199,6 +275,7 @@ impl UnfreezeHandle {
             #[cfg(not(unix))]
             UnfreezeHandle::Process { .. } => 0,
             UnfreezeHandle::Iterator => 0,
+            UnfreezeHandle::Thread { .. } => 0,
         }
     }
 
@@ -212,6 +289,13 @@ impl UnfreezeHandle {
             UnfreezeHandle::Process { .. } => {}
             // Dropping the pipeline_state Box in FrozenJob.kill() handles iterator cleanup.
             UnfreezeHandle::Iterator => {}
+            UnfreezeHandle::Thread {
+                interrupt,
+                suspend_state,
+            } => {
+                interrupt.store(true, Ordering::SeqCst);
+                suspend_state.resume(); // wake thread so it can observe the interrupt
+            }
         }
     }
 }

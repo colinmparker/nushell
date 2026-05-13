@@ -1,10 +1,13 @@
 #![allow(clippy::byte_char_slices)]
 
 use nu_cmd_base::hook::eval_hook;
+#[cfg(unix)]
+use nu_engine::{CommandThread, is_on_command_thread, orchestrate_command_thread};
 use nu_engine::{eval_block, eval_block_with_early_return, wrap_suspendable};
 use nu_parser::{Token, TokenContents, lex, parse, unescape_unquote_string};
 use nu_protocol::{
-    PipelineData, ShellError, Span, Value,
+    PipelineData, PipelineExecutionData, ShellError, Span, Value,
+    ast::Block,
     debugger::WithoutDebug,
     engine::{EngineState, Stack, StateWorkingSet},
     process::check_exit_status_future,
@@ -279,6 +282,52 @@ pub fn eval_source(
     exit_code
 }
 
+/// Evaluates a parsed block, using a pipeline worker thread for interactive REPL sessions on Unix.
+///
+/// On Unix interactive non-background sessions, dispatches `block` to a `CommandThread` so that
+/// Ctrl+Z (SIGTSTP) can cooperatively suspend consuming commands (e.g. `sort-by`, `save`) during
+/// the eval phase (Phase 1). For all other contexts — sourced files, non-interactive mode, Windows
+/// — falls back to the plain synchronous eval path.
+///
+/// This function is intentionally placed at the REPL boundary (called only from `evaluate_source`)
+/// rather than inside `eval_block`, to avoid re-threading lazy closures produced by commands like
+/// `each`. Those closures run on the main thread during streaming (Phase 2), where `SuspendableIter`
+/// handles freeze; threading them again would consume the SIGTSTP flag before `SuspendableIter`
+/// could observe it.
+fn evaluate_block(
+    engine_state: &mut EngineState,
+    stack: &mut Stack,
+    block: &Block,
+    input: PipelineData,
+    allow_return: bool,
+) -> Result<PipelineExecutionData, ShellError> {
+    #[cfg(unix)]
+    if !allow_return
+        && engine_state.is_interactive
+        && !engine_state.is_background_job()
+        && !is_on_command_thread()
+        && !block.pipelines.is_empty()
+    {
+        use nu_system::SIGTSTP_FLAG;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        // Clear any stale SIGTSTP from a previous pipeline.
+        SIGTSTP_FLAG.store(false, Ordering::SeqCst);
+
+        let block_arc = Arc::new(block.clone());
+        let stack_snapshot = stack.clone();
+        let ct = CommandThread::spawn(engine_state, stack_snapshot, block_arc, input);
+        return orchestrate_command_thread(engine_state, ct);
+    }
+
+    if allow_return {
+        eval_block_with_early_return::<WithoutDebug>(engine_state, stack, block, input)
+    } else {
+        eval_block::<WithoutDebug>(engine_state, stack, block, input)
+    }
+}
+
 fn evaluate_source(
     engine_state: &mut EngineState,
     stack: &mut Stack,
@@ -314,11 +363,7 @@ fn evaluate_source(
 
     engine_state.merge_delta(delta)?;
 
-    let pipeline = if allow_return {
-        eval_block_with_early_return::<WithoutDebug>(engine_state, stack, &block, input)
-    } else {
-        eval_block::<WithoutDebug>(engine_state, stack, &block, input)
-    }?;
+    let pipeline = evaluate_block(engine_state, stack, &block, input, allow_return)?;
     let pipeline_data = pipeline.body;
 
     // Update engine_state with deleted variables

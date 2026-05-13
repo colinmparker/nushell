@@ -1,7 +1,6 @@
-use nu_engine::FrozenIteratorState;
 use nu_engine::command_prelude::*;
 use nu_protocol::{
-    JobId, ListStream, Signals,
+    FrozenIteratorState, JobId, ListStream, Signals,
     engine::{FrozenJob, Job, ThreadJob},
     process::check_ok,
 };
@@ -98,8 +97,21 @@ fn unfreeze_job(
             pipeline_state,
         }) => {
             // Iterator-based pipeline jobs are handled directly.
-            if matches!(handle, UnfreezeHandle::Iterator) {
-                return unfreeze_iterator_job(pipeline_state, span);
+            if let UnfreezeHandle::Iterator = handle {
+                let Some(frozen) = pipeline_state
+                    .and_then(|b| b.downcast::<FrozenIteratorState>().ok())
+                    .map(|b| *b)
+                else {
+                    return Ok(PipelineData::Empty);
+                };
+                let stream = ListStream::new(frozen.inner, frozen.span, Signals::empty());
+                return Ok(PipelineData::list_stream(stream, frozen.metadata));
+            }
+
+            // Thread-based pipeline jobs: resume the worker and re-enter the wait loop.
+            #[cfg(unix)]
+            if let UnfreezeHandle::Thread { .. } = &handle {
+                return unfreeze_thread_job(state, pipeline_state);
             }
 
             // External process job.
@@ -163,22 +175,30 @@ fn unfreeze_job(
     }
 }
 
-/// Resume an iterator-based frozen pipeline, returning the remaining stream output.
+/// Resume a thread-based pipeline job by re-entering the orchestrator wait loop.
 ///
-/// The returned `ListStream` will be re-wrapped in a `SuspendableIter` at the REPL
-/// boundary (`wrap_suspendable`), so Ctrl+Z works again during resumed printing.
-fn unfreeze_iterator_job(
+/// Resumes the parked worker thread, then hands off to `orchestrate_command_thread`
+/// which polls for the result while checking for Ctrl+Z (re-freeze) and Ctrl+C.
+#[cfg(unix)]
+fn unfreeze_thread_job(
+    engine_state: &EngineState,
     pipeline_state: Option<Box<dyn std::any::Any + Send>>,
-    _span: Span,
 ) -> Result<PipelineData, ShellError> {
-    let frozen = pipeline_state
-        .and_then(|b| b.downcast::<FrozenIteratorState>().ok())
-        .map(|b| *b);
+    use nu_engine::{CommandThread, FrozenCommandThreadState, orchestrate_command_thread};
 
-    let Some(state) = frozen else {
+    let Some(frozen) = pipeline_state
+        .and_then(|b| b.downcast::<FrozenCommandThreadState>().ok())
+        .map(|b| *b)
+    else {
         return Ok(PipelineData::Empty);
     };
 
-    let stream = ListStream::new(state.inner, state.span, Signals::empty());
-    Ok(PipelineData::list_stream(stream, state.metadata))
+    // Resume the worker — it will unpark from its condvar and continue executing.
+    frozen.suspend_state.resume();
+
+    // Reconstruct a CommandThread-like handle so we can pass it to the shared orchestrator.
+    // We rebuild by wrapping the preserved channels in a new CommandThread.
+    let ct = CommandThread::from_frozen(frozen);
+    let ped = orchestrate_command_thread(engine_state, ct)?;
+    Ok(ped.body)
 }

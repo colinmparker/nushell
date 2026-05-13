@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{
         Arc, Mutex,
@@ -234,11 +235,13 @@ impl Job {
 pub struct FrozenJob {
     pub unfreeze: UnfreezeHandle,
     pub description: Option<String>,
-    /// Opaque streaming state (e.g. `FrozenPipelineState`) carried across freeze/resume cycles.
+    /// Opaque pipeline state (e.g. `FrozenIteratorState` or `FrozenCommandThreadState`)
+    /// carried across freeze/resume cycles.
     ///
-    /// Stored as `Box<dyn Any + Send>` to avoid a dependency cycle between `nu-protocol`
-    /// and `nu-engine`.  The concrete type is `nu_engine::FrozenPipelineState`.
-    pub pipeline_state: Option<Box<dyn std::any::Any + Send>>,
+    /// Stored as `Box<dyn Any + Send>` to avoid a dependency cycle: `nu-protocol` cannot
+    /// depend on `nu-engine`, so the concrete type is downcast at the call site in
+    /// `nu-command`'s `job unfreeze`.
+    pub pipeline_state: Option<Box<dyn Any + Send>>,
 }
 
 impl std::fmt::Debug for FrozenJob {

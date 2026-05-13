@@ -1,18 +1,12 @@
 use std::sync::{Arc, Mutex, atomic::Ordering};
 
+#[cfg(unix)]
+use nu_protocol::Signals;
 use nu_protocol::{
-    PipelineData, PipelineMetadata, Signals, Span, ValueIterator,
+    FrozenIteratorState, PipelineData, PipelineMetadata, Span, ValueIterator,
     engine::{EngineState, FrozenJob, Job, Jobs},
 };
 use nu_system::{SIGTSTP_FLAG, UnfreezeHandle};
-
-/// Iterator state preserved across a freeze/resume cycle.
-pub struct FrozenIteratorState {
-    pub inner: ValueIterator,
-    pub span: Span,
-    /// Metadata carries `row_offset` — the number of rows already displayed before this freeze.
-    pub metadata: PipelineMetadata,
-}
 
 /// A thin wrapper iterator that checks `SIGTSTP_FLAG` before each value pull.
 ///
@@ -43,7 +37,7 @@ impl SuspendableIter {
             jobs,
             is_interactive,
             span,
-            metadata: metadata.unwrap_or(PipelineMetadata::default()),
+            metadata: metadata.unwrap_or_default(),
         }
     }
 }

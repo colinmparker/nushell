@@ -37,7 +37,7 @@ pub use self::exit_status::ExitStatus;
 #[cfg(unix)]
 pub use self::foreground::stdin_fd;
 pub use self::foreground::{
-    ForegroundChild, ForegroundGuard, ForegroundWaitStatus, UnfreezeHandle,
+    ForegroundChild, ForegroundGuard, ForegroundWaitStatus, SuspendState, UnfreezeHandle,
 };
 
 pub use self::util::*;

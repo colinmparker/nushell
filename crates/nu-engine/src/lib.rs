@@ -3,6 +3,8 @@ mod call_ext;
 mod closure_eval;
 pub mod column;
 pub mod command_prelude;
+#[cfg(unix)]
+mod command_thread;
 mod compile;
 pub mod documentation;
 pub mod env;
@@ -17,9 +19,13 @@ mod suspendable_iter;
 pub use call_ext::CallExt;
 pub use closure_eval::*;
 pub use column::get_columns;
+#[cfg(unix)]
+pub use command_thread::{CommandThread, FrozenCommandThreadState, is_on_command_thread};
 pub use compile::compile;
 pub use documentation::get_full_help;
 pub use env::*;
+#[cfg(unix)]
+pub use eval::orchestrate_command_thread;
 pub use eval::{
     eval_block, eval_block_with_early_return, eval_call, eval_expression,
     eval_expression_with_input, eval_subexpression, eval_variable, redirect_env,
@@ -28,4 +34,4 @@ pub use eval_helpers::*;
 pub use eval_ir::eval_ir_block;
 pub use glob_from::glob_from;
 pub use scope::find_builtin_decl;
-pub use suspendable_iter::{FrozenIteratorState, SuspendableIter, wrap_suspendable};
+pub use suspendable_iter::{SuspendableIter, wrap_suspendable};
