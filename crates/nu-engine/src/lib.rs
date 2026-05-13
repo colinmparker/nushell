@@ -14,7 +14,6 @@ mod eval_ir;
 pub mod exit;
 mod glob_from;
 pub mod scope;
-mod suspendable_iter;
 
 pub use call_ext::CallExt;
 pub use closure_eval::*;
@@ -34,4 +33,3 @@ pub use eval_helpers::*;
 pub use eval_ir::eval_ir_block;
 pub use glob_from::glob_from;
 pub use scope::find_builtin_decl;
-pub use suspendable_iter::{SuspendableIter, wrap_suspendable};

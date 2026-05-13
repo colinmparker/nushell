@@ -3,10 +3,10 @@
 use nu_cmd_base::hook::eval_hook;
 #[cfg(unix)]
 use nu_engine::{CommandThread, is_on_command_thread, orchestrate_command_thread};
-use nu_engine::{eval_block, eval_block_with_early_return, wrap_suspendable};
+use nu_engine::{eval_block, eval_block_with_early_return};
 use nu_parser::{Token, TokenContents, lex, parse, unescape_unquote_string};
 use nu_protocol::{
-    PipelineData, PipelineExecutionData, ShellError, Span, Value,
+    PipelineData, ShellError, Span, Value,
     ast::Block,
     debugger::WithoutDebug,
     engine::{EngineState, Stack, StateWorkingSet},
@@ -282,49 +282,65 @@ pub fn eval_source(
     exit_code
 }
 
-/// Evaluates a parsed block, using a pipeline worker thread for interactive REPL sessions on Unix.
+/// Evaluate `block` + print its output on a single worker thread with cooperative Ctrl+Z support.
 ///
-/// On Unix interactive non-background sessions, dispatches `block` to a `CommandThread` so that
-/// Ctrl+Z (SIGTSTP) can cooperatively suspend consuming commands (e.g. `sort-by`, `save`) during
-/// the eval phase (Phase 1). For all other contexts — sourced files, non-interactive mode, Windows
-/// — falls back to the plain synchronous eval path.
+/// The worker runs with suspend-aware [`Signals`], so every `signals.check()` call anywhere in
+/// the pipeline — including inside `sleep`, `each` closures, and consuming commands — is a
+/// cooperative freeze point. On Ctrl+Z the worker parks on a condvar; `job unfreeze` resumes it.
 ///
-/// This function is intentionally placed at the REPL boundary (called only from `evaluate_source`)
-/// rather than inside `eval_block`, to avoid re-threading lazy closures produced by commands like
-/// `each`. Those closures run on the main thread during streaming (Phase 2), where `SuspendableIter`
-/// handles freeze; threading them again would consume the SIGTSTP flag before `SuspendableIter`
-/// could observe it.
-fn evaluate_block(
+/// The worker sends its final [`Stack`] back so env var assignments and other mutations are
+/// visible to the REPL after the pipeline completes.
+#[cfg(unix)]
+fn evaluate_source_threaded(
     engine_state: &mut EngineState,
     stack: &mut Stack,
     block: &Block,
     input: PipelineData,
-    allow_return: bool,
-) -> Result<PipelineExecutionData, ShellError> {
-    #[cfg(unix)]
-    if !allow_return
-        && engine_state.is_interactive
-        && !engine_state.is_background_job()
-        && !is_on_command_thread()
-        && !block.pipelines.is_empty()
-    {
-        use nu_system::SIGTSTP_FLAG;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
+) -> Result<bool, ShellError> {
+    use nu_system::SIGTSTP_FLAG;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
-        // Clear any stale SIGTSTP from a previous pipeline.
-        SIGTSTP_FLAG.store(false, Ordering::SeqCst);
+    // Clear any stale SIGTSTP from a previous pipeline before starting.
+    SIGTSTP_FLAG.store(false, Ordering::SeqCst);
 
-        let block_arc = Arc::new(block.clone());
-        let stack_snapshot = stack.clone();
-        let ct = CommandThread::spawn(engine_state, stack_snapshot, block_arc, input);
-        return orchestrate_command_thread(engine_state, ct);
-    }
+    let block_arc = Arc::new(block.clone());
+    let mut worker_stack = stack.clone();
 
-    if allow_return {
-        eval_block_with_early_return::<WithoutDebug>(engine_state, stack, block, input)
-    } else {
-        eval_block::<WithoutDebug>(engine_state, stack, block, input)
+    let ct = CommandThread::spawn_with(engine_state, move |worker_es| {
+        let ped = eval_block::<WithoutDebug>(worker_es, &mut worker_stack, &block_arc, input)?;
+        let pipeline_data = ped.body;
+        let exit_status = ped.exit;
+
+        let no_newline = matches!(&pipeline_data, &PipelineData::ByteStream(..));
+        print_pipeline(worker_es, &mut worker_stack, pipeline_data, no_newline)?;
+
+        if nu_experimental::PIPE_FAIL.get() {
+            check_exit_status_future(exit_status)?;
+        }
+
+        Ok(worker_stack)
+    });
+
+    match orchestrate_command_thread(engine_state, ct)? {
+        Some(worker_stack) => {
+            // Apply the worker's variable deletions to the shared engine_state.
+            for var_id in &worker_stack.deletions {
+                if let Some(active_id) = engine_state.scope.active_overlays.last()
+                    && let Some((_, overlay)) =
+                        engine_state.scope.overlays.get_mut((*active_id).get())
+                {
+                    overlay.vars.retain(|_, v| *v != *var_id);
+                }
+            }
+            // Replace the caller's stack with the worker's final stack so env var
+            // assignments and other mutations from the pipeline are visible in the REPL.
+            *stack = worker_stack;
+            stack.deletions.clear();
+            Ok(false)
+        }
+        // Pipeline was frozen or interrupted — nothing more to do.
+        None => Ok(false),
     }
 }
 
@@ -363,10 +379,28 @@ fn evaluate_source(
 
     engine_state.merge_delta(delta)?;
 
-    let pipeline = evaluate_block(engine_state, stack, &block, input, allow_return)?;
+    // For interactive Unix sessions, dispatch to a single worker thread that runs both eval and
+    // print. This gives cooperative Ctrl+Z freeze support for the entire pipeline lifetime,
+    // including inside sleep, each closures, and consuming commands like sort-by and save.
+    #[cfg(unix)]
+    if !allow_return
+        && engine_state.is_interactive
+        && !engine_state.is_background_job()
+        && !is_on_command_thread()
+        && !block.pipelines.is_empty()
+    {
+        return evaluate_source_threaded(engine_state, stack, &block, input);
+    }
+
+    // Synchronous path: sourced files, non-interactive mode, Windows, background jobs.
+    let pipeline = if allow_return {
+        eval_block_with_early_return::<WithoutDebug>(engine_state, stack, &block, input)?
+    } else {
+        eval_block::<WithoutDebug>(engine_state, stack, &block, input)?
+    };
     let pipeline_data = pipeline.body;
 
-    // Update engine_state with deleted variables
+    // Update engine_state with deleted variables.
     for var_id in &stack.deletions {
         if let Some(active_id) = engine_state.scope.active_overlays.last()
             && let Some((_, overlay)) = engine_state.scope.overlays.get_mut((*active_id).get())
@@ -375,10 +409,6 @@ fn evaluate_source(
         }
     }
     stack.deletions.clear();
-
-    // Wrap the output in a SuspendableIter so Ctrl+Z can freeze the pipeline mid-stream
-    // at the REPL boundary. Also clears any stale SIGTSTP flag from a previous pipeline.
-    let pipeline_data = wrap_suspendable(engine_state, pipeline_data);
 
     let no_newline = matches!(&pipeline_data, &PipelineData::ByteStream(..));
     print_pipeline(engine_state, stack, pipeline_data, no_newline)?;

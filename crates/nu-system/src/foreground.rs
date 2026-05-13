@@ -186,6 +186,10 @@ impl SuspendState {
 
     /// Resume suspended threads.
     pub fn resume(&self) {
+        // Hold the mutex while setting `suspended` and notifying.
+        // This prevents a lost-wakeup where `notify_all` fires before the worker
+        // has entered `condvar.wait`, leaving the worker stuck indefinitely.
+        let _guard = self.mutex.lock().expect("suspend mutex");
         self.suspended.store(false, Ordering::SeqCst);
         self.condvar.notify_all();
     }
@@ -202,16 +206,25 @@ impl SuspendState {
 
     /// Cooperative yield point. Blocks if suspended; returns immediately otherwise.
     ///
-    /// When the thread parks, it first notifies the orchestrator via the frozen channel,
-    /// then waits on the condvar until [`resume`](Self::resume) is called.
+    /// When the thread parks, it sends the "parked" notification while holding the condvar
+    /// mutex, then atomically releases the mutex and enters `condvar.wait`. Sending inside
+    /// the mutex guarantees that [`resume`](Self::resume) cannot fire `notify_all` before
+    /// the worker is actually waiting, eliminating the lost-wakeup race.
     pub fn wait_if_suspended(&self) {
+        // Fast path: avoid locking if not suspended.
         if self.suspended.load(Ordering::SeqCst) {
-            if let Some(tx) = self.frozen_tx.lock().expect("frozen_tx lock").as_ref() {
-                let _ = tx.try_send(());
-            }
             let mut guard = self.mutex.lock().expect("suspend mutex");
-            while self.suspended.load(Ordering::SeqCst) {
-                guard = self.condvar.wait(guard).expect("condvar wait");
+            // Re-check inside the mutex to close the TOCTOU window between the fast-path
+            // load and acquiring the lock.
+            if self.suspended.load(Ordering::SeqCst) {
+                // Notify the orchestrator while holding the mutex.  This ensures resume()
+                // cannot set suspended=false and fire notify_all before we enter condvar.wait.
+                if let Some(tx) = self.frozen_tx.lock().expect("frozen_tx lock").as_ref() {
+                    let _ = tx.try_send(());
+                }
+                while self.suspended.load(Ordering::SeqCst) {
+                    guard = self.condvar.wait(guard).expect("condvar wait");
+                }
             }
         }
     }
@@ -229,11 +242,8 @@ pub enum UnfreezeHandle {
         #[cfg(unix)]
         child_pid: Pid,
     },
-    /// A frozen internal pipeline (iterator-based). The actual iterator state is stored
-    /// in [`FrozenJob::pipeline_state`] as `Box<dyn Any + Send>`.
-    Iterator,
     /// A frozen internal pipeline (thread-based). The worker thread is parked on the
-    /// condvar in `suspend_state`.
+    /// condvar in `suspend_state` and resumes execution when unparked.
     Thread {
         suspend_state: Arc<SuspendState>,
         interrupt: Arc<AtomicBool>,
@@ -261,8 +271,8 @@ impl UnfreezeHandle {
 
                 unix_wait(child_pid)
             }
-            // Iterator/Thread-based pipelines are handled directly in job_unfreeze, not here.
-            UnfreezeHandle::Iterator | UnfreezeHandle::Thread { .. } => {
+            // Thread-based pipelines are handled directly in job_unfreeze, not here.
+            UnfreezeHandle::Thread { .. } => {
                 Ok(ForegroundWaitStatus::Finished(ExitStatus::Exited(0)))
             }
         }
@@ -274,7 +284,6 @@ impl UnfreezeHandle {
             UnfreezeHandle::Process { child_pid } => child_pid.as_raw() as u32,
             #[cfg(not(unix))]
             UnfreezeHandle::Process { .. } => 0,
-            UnfreezeHandle::Iterator => 0,
             UnfreezeHandle::Thread { .. } => 0,
         }
     }
@@ -287,8 +296,6 @@ impl UnfreezeHandle {
             }
             #[cfg(not(unix))]
             UnfreezeHandle::Process { .. } => {}
-            // Dropping the pipeline_state Box in FrozenJob.kill() handles iterator cleanup.
-            UnfreezeHandle::Iterator => {}
             UnfreezeHandle::Thread {
                 interrupt,
                 suspend_state,

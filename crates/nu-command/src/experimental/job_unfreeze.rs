@@ -1,6 +1,6 @@
 use nu_engine::command_prelude::*;
 use nu_protocol::{
-    FrozenIteratorState, JobId, ListStream, Signals,
+    JobId,
     engine::{FrozenJob, Job, ThreadJob},
     process::check_ok,
 };
@@ -96,19 +96,8 @@ fn unfreeze_job(
             description,
             pipeline_state,
         }) => {
-            // Iterator-based pipeline jobs are handled directly.
-            if let UnfreezeHandle::Iterator = handle {
-                let Some(frozen) = pipeline_state
-                    .and_then(|b| b.downcast::<FrozenIteratorState>().ok())
-                    .map(|b| *b)
-                else {
-                    return Ok(PipelineData::Empty);
-                };
-                let stream = ListStream::new(frozen.inner, frozen.span, Signals::empty());
-                return Ok(PipelineData::list_stream(stream, frozen.metadata));
-            }
-
             // Thread-based pipeline jobs: resume the worker and re-enter the wait loop.
+            // The worker continues printing from where it was suspended; we just wait for it.
             #[cfg(unix)]
             if let UnfreezeHandle::Thread { .. } = &handle {
                 return unfreeze_thread_job(state, pipeline_state);
@@ -178,7 +167,8 @@ fn unfreeze_job(
 /// Resume a thread-based pipeline job by re-entering the orchestrator wait loop.
 ///
 /// Resumes the parked worker thread, then hands off to `orchestrate_command_thread`
-/// which polls for the result while checking for Ctrl+Z (re-freeze) and Ctrl+C.
+/// which polls for completion while checking for Ctrl+Z (re-freeze) and Ctrl+C.
+/// The worker handles printing internally; this function returns `Empty` when done.
 #[cfg(unix)]
 fn unfreeze_thread_job(
     engine_state: &EngineState,
@@ -196,9 +186,10 @@ fn unfreeze_thread_job(
     // Resume the worker — it will unpark from its condvar and continue executing.
     frozen.suspend_state.resume();
 
-    // Reconstruct a CommandThread-like handle so we can pass it to the shared orchestrator.
-    // We rebuild by wrapping the preserved channels in a new CommandThread.
     let ct = CommandThread::from_frozen(frozen);
-    let ped = orchestrate_command_thread(engine_state, ct)?;
-    Ok(ped.body)
+    // Worker may finish, re-freeze, or be interrupted. In all cases we return Empty
+    // since the worker handles printing and stack mutations are discarded (the resumed
+    // pipeline was from a previous REPL entry).
+    orchestrate_command_thread(engine_state, ct)?;
+    Ok(PipelineData::Empty)
 }

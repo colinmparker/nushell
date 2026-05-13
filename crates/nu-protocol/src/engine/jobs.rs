@@ -235,8 +235,7 @@ impl Job {
 pub struct FrozenJob {
     pub unfreeze: UnfreezeHandle,
     pub description: Option<String>,
-    /// Opaque pipeline state (e.g. `FrozenIteratorState` or `FrozenCommandThreadState`)
-    /// carried across freeze/resume cycles.
+    /// Opaque pipeline state (e.g. `FrozenCommandThreadState`) carried across freeze/resume cycles.
     ///
     /// Stored as `Box<dyn Any + Send>` to avoid a dependency cycle: `nu-protocol` cannot
     /// depend on `nu-engine`, so the concrete type is downcast at the call site in

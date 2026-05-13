@@ -2,7 +2,7 @@
 use crate::process::ExitStatusGuard;
 use crate::{
     ByteStream, ByteStreamSource, ByteStreamType, Config, ListStream, OutDest, PipelineMetadata,
-    Range, ShellError, Signals, Span, Type, Value, ValueIterator,
+    Range, ShellError, Signals, Span, Type, Value,
     ast::{Call, PathMember},
     engine::{EngineState, Stack},
     shell_error::{generic::GenericError, io::IoError},
@@ -1176,21 +1176,5 @@ impl From<PipelineData> for PipelineExecutionData {
     #[cfg(not(feature = "os"))]
     fn from(value: PipelineData) -> Self {
         Self { body: value }
-    }
-}
-
-/// Iterator state preserved across a freeze/resume cycle.
-pub struct FrozenIteratorState {
-    pub inner: ValueIterator,
-    pub span: Span,
-    pub metadata: PipelineMetadata,
-}
-
-impl std::fmt::Debug for FrozenIteratorState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FrozenIteratorState")
-            .field("span", &self.span)
-            .field("metadata", &self.metadata)
-            .finish()
     }
 }

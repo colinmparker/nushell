@@ -492,15 +492,18 @@ pub fn eval_block<D: DebugContext>(
     result
 }
 
-/// Shared wait loop used by both `nu-cli`'s `evaluate_block` and `job unfreeze`.
+/// Shared wait loop used by both `nu-cli`'s `evaluate_source_threaded` and `job unfreeze`.
 ///
-/// Polls the worker's result channel, checking for Ctrl+Z (freeze) and Ctrl+C (interrupt)
-/// on each timeout. Returns the worker's `PipelineData` result, or `Empty` on freeze/interrupt.
+/// Polls the worker's result channel with 100ms timeouts, checking for Ctrl+Z (freeze) and
+/// Ctrl+C (interrupt) on each expiry.
+///
+/// Returns `Some(stack)` when the worker completes normally, or `None` when the pipeline is
+/// frozen or interrupted. Returns `Err` if the worker thread exited unexpectedly.
 #[cfg(unix)]
 pub fn orchestrate_command_thread(
     engine_state: &EngineState,
     ct: crate::command_thread::CommandThread,
-) -> Result<PipelineExecutionData, ShellError> {
+) -> Result<Option<Stack>, ShellError> {
     use nu_protocol::engine::{FrozenJob, Job};
     use nu_system::{SIGTSTP_FLAG, UnfreezeHandle};
     use std::sync::atomic::Ordering;
@@ -509,9 +512,7 @@ pub fn orchestrate_command_thread(
 
     loop {
         match ct.result_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(result) => {
-                return Ok(PipelineExecutionData::from(result?));
-            }
+            Ok(result) => return result.map(Some),
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(ShellError::NushellFailed {
                     msg: "pipeline worker thread exited unexpectedly".into(),
@@ -523,8 +524,28 @@ pub fn orchestrate_command_thread(
         // Check for Ctrl+Z (SIGTSTP) — freeze the pipeline.
         if SIGTSTP_FLAG.swap(false, Ordering::SeqCst) {
             ct.suspend();
-            // Give the thread up to 500ms to reach a yield point and confirm it's parked.
-            ct.wait_for_frozen(Duration::from_millis(500));
+
+            // Wait until the worker either confirms it is parked (frozen_rx) or
+            // finishes on its own (result_rx) before we create the FrozenJob.
+            // We must not proceed until one of these two outcomes is definite —
+            // ignoring the return value here was the root cause of the bug where
+            // the pipeline continued running after "Job N is frozen" was printed.
+            loop {
+                match ct.result_rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(result) => return result.map(Some),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(ShellError::NushellFailed {
+                            msg: "pipeline worker thread exited unexpectedly".into(),
+                        });
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+
+                if ct.frozen_rx.recv_timeout(Duration::from_millis(20)).is_ok() {
+                    // Worker has confirmed it is parked on the condvar.
+                    break;
+                }
+            }
 
             let frozen_state = ct.into_frozen_state();
 
@@ -545,14 +566,14 @@ pub fn orchestrate_command_thread(
                 eprintln!("\nJob {} is frozen", job_id.get());
             }
 
-            return Ok(PipelineExecutionData::empty());
+            return Ok(None);
         }
 
         // Check for Ctrl+C (interrupt) — abort the pipeline.
         if engine_state.signals().interrupted() {
             ct.interrupt.store(true, Ordering::SeqCst);
             ct.suspend_state.resume(); // wake if parked so it can observe the interrupt
-            return Ok(PipelineExecutionData::empty());
+            return Ok(None);
         }
     }
 }
