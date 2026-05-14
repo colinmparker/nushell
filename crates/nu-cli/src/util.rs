@@ -5,9 +5,10 @@ use nu_cmd_base::hook::eval_hook;
 use nu_engine::{CommandThread, is_on_command_thread, orchestrate_command_thread};
 use nu_engine::{eval_block, eval_block_with_early_return};
 use nu_parser::{Token, TokenContents, lex, parse, unescape_unquote_string};
+#[cfg(unix)]
+use nu_protocol::ast::Block;
 use nu_protocol::{
     PipelineData, ShellError, Span, Value,
-    ast::Block,
     debugger::WithoutDebug,
     engine::{EngineState, Stack, StateWorkingSet},
     process::check_exit_status_future,
