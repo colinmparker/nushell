@@ -53,8 +53,7 @@ impl Command for JobList {
                         ),
 
                         Job::Frozen(FrozenJob { unfreeze, .. }) => {
-                            let pid = unfreeze.pid();
-                            if pid > 0 {
+                            if let Some(pid) = unfreeze.pid() {
                                 Value::list(vec![Value::int(pid as i64, head)], head)
                             } else {
                                 Value::list(vec![], head)

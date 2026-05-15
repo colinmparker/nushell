@@ -36,25 +36,13 @@ impl Signals {
     ///
     /// Once `ctrlc` is set to `true`, [`check`](Self::check) will error
     /// and [`interrupted`](Self::interrupted) will return `true`.
-    pub fn new(ctrlc: Arc<AtomicBool>) -> Self {
-        Self {
-            inner: Some(Arc::new(SignalsInner {
-                interrupt: ctrlc,
-                suspend: None,
-            })),
-        }
-    }
-
-    /// Create a [`Signals`] with both interrupt and cooperative suspend support.
     ///
-    /// The `suspend` state is used by pipeline worker threads; calling
-    /// [`wait_if_suspended`](Self::wait_if_suspended) will park the thread until
-    /// [`SuspendState::resume`] is called.
-    pub fn with_suspend(ctrlc: Arc<AtomicBool>, suspend: Arc<SuspendState>) -> Self {
+    /// Pass `Some(suspend)` to enable cooperative suspension for pipeline worker threads.
+    pub fn new(ctrlc: Arc<AtomicBool>, suspend: Option<Arc<SuspendState>>) -> Self {
         Self {
             inner: Some(Arc::new(SignalsInner {
                 interrupt: ctrlc,
-                suspend: Some(suspend),
+                suspend,
             })),
         }
     }

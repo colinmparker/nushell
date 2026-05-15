@@ -494,86 +494,72 @@ pub fn eval_block<D: DebugContext>(
 
 /// Shared wait loop used by both `nu-cli`'s `evaluate_source_threaded` and `job unfreeze`.
 ///
-/// Polls the worker's result channel with 100ms timeouts, checking for Ctrl+Z (freeze) and
-/// Ctrl+C (interrupt) on each expiry.
+/// Blocks on the shared condvar until the worker finishes, checking for Ctrl+Z (freeze) and
+/// Ctrl+C (interrupt) on each 100ms timeout.
 ///
 /// Returns `Some(stack)` when the worker completes normally, or `None` when the pipeline is
-/// frozen or interrupted. Returns `Err` if the worker thread exited unexpectedly.
+/// frozen or interrupted.
 #[cfg(unix)]
-pub fn orchestrate_command_thread(
+pub fn foreground_command_thread(
     engine_state: &EngineState,
-    ct: crate::command_thread::CommandThread,
+    ct: nu_protocol::engine::CommandThread,
 ) -> Result<Option<Stack>, ShellError> {
     use nu_protocol::engine::{FrozenJob, Job};
-    use nu_system::{SIGTSTP_FLAG, UnfreezeHandle};
+    use nu_system::{SIGTSTP_FLAG, SuspendEvent, UnfreezeHandle};
     use std::sync::atomic::Ordering;
-    use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
 
     loop {
-        match ct.result_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(result) => return result.map(Some),
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(ShellError::NushellFailed {
-                    msg: "pipeline worker thread exited unexpectedly".into(),
-                });
-            }
-            Err(RecvTimeoutError::Timeout) => {}
+        // Block until the worker finishes or 100ms elapses (to poll signal flags).
+        match ct
+            .suspend_state
+            .wait_for_event(Some(Duration::from_millis(100)))
+        {
+            SuspendEvent::Finished => return ct.join().map(Some),
+            SuspendEvent::Parked => unreachable!("worker parked without suspend request"),
+            SuspendEvent::Timeout => {}
         }
 
         // Check for Ctrl+Z (SIGTSTP) — freeze the pipeline.
         if SIGTSTP_FLAG.swap(false, Ordering::SeqCst) {
             ct.suspend();
 
-            // Wait until the worker either confirms it is parked (frozen_rx) or
-            // finishes on its own (result_rx) before we create the FrozenJob.
-            // We must not proceed until one of these two outcomes is definite —
-            // ignoring the return value here was the root cause of the bug where
-            // the pipeline continued running after "Job N is frozen" was printed.
-            loop {
-                match ct.result_rx.recv_timeout(Duration::from_millis(20)) {
-                    Ok(result) => return result.map(Some),
-                    Err(RecvTimeoutError::Disconnected) => {
-                        return Err(ShellError::NushellFailed {
-                            msg: "pipeline worker thread exited unexpectedly".into(),
-                        });
+            // Block until the worker parks or finishes before creating the FrozenJob.
+            match ct.suspend_state.wait_for_event(None) {
+                SuspendEvent::Parked => {
+                    let suspend_state = ct.suspend_state.clone();
+                    let interrupt = ct.interrupt.clone();
+                    let handle = UnfreezeHandle::Thread {
+                        suspend_state,
+                        interrupt,
+                    };
+                    let job = Job::Frozen(FrozenJob {
+                        unfreeze: handle,
+                        description: Some("pipeline".into()),
+                        command_thread: Some(ct),
+                    });
+                    let job_id = engine_state.jobs.lock().expect("jobs lock").add_job(job);
+                    if engine_state.is_interactive {
+                        eprintln!("\nJob {} is frozen", job_id.get());
                     }
-                    Err(RecvTimeoutError::Timeout) => {}
+                    return Ok(None);
                 }
-
-                if ct.frozen_rx.recv_timeout(Duration::from_millis(20)).is_ok() {
-                    // Worker has confirmed it is parked on the condvar.
-                    break;
-                }
+                SuspendEvent::Finished => return ct.join().map(Some),
+                SuspendEvent::Timeout => unreachable!(),
             }
-
-            let frozen_state = ct.into_frozen_state();
-
-            let handle = UnfreezeHandle::Thread {
-                suspend_state: frozen_state.suspend_state.clone(),
-                interrupt: frozen_state.interrupt.clone(),
-            };
-
-            let job = Job::Frozen(FrozenJob {
-                unfreeze: handle,
-                description: Some("pipeline".into()),
-                pipeline_state: Some(Box::new(frozen_state)),
-            });
-
-            let job_id = engine_state.jobs.lock().expect("jobs lock").add_job(job);
-
-            if engine_state.is_interactive {
-                eprintln!("\nJob {} is frozen", job_id.get());
-            }
-
-            return Ok(None);
         }
 
         // Check for Ctrl+C (interrupt) — abort the pipeline.
         if engine_state.signals().interrupted() {
             ct.interrupt.store(true, Ordering::SeqCst);
-            ct.suspend_state.resume(); // wake if parked so it can observe the interrupt
-            return Ok(None);
+            ct.suspend_state.resume();
+            match ct.suspend_state.wait_for_event(None) {
+                SuspendEvent::Finished => {
+                    let _ = ct.join();
+                    return Ok(None);
+                }
+                _ => unreachable!(),
+            }
         }
     }
 }

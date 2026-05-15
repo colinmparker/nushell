@@ -1,8 +1,8 @@
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU32, Ordering},
-    mpsc,
 };
+use std::time::Duration;
 
 use std::io;
 
@@ -156,75 +156,125 @@ impl From<std::process::ExitStatus> for ForegroundWaitStatus {
     }
 }
 
+struct SuspendInner {
+    suspended: bool,
+    parked: bool,
+    finished: bool,
+}
+
+/// Events returned by [`SuspendState::wait_for_event`].
+pub enum SuspendEvent {
+    /// The worker thread called [`SuspendState::mark_finished`] and has exited.
+    Finished,
+    /// The worker thread parked at a yield point after [`SuspendState::suspend`] was called.
+    Parked,
+    /// The timeout elapsed with no event.
+    Timeout,
+}
+
 /// Cooperative suspension state for internal (thread-based) pipelines.
 ///
-/// When suspended, threads calling [`wait_if_suspended`](Self::wait_if_suspended) will block
-/// until [`resume`](Self::resume) is called. Used by `CommandThread` to park the worker at the
-/// next cooperative yield point (a `signals.check()` or `InterruptIter::next()` call).
+/// The worker calls [`wait_if_suspended`](Self::wait_if_suspended) at yield points and
+/// [`mark_finished`](Self::mark_finished) on exit. The orchestrator calls
+/// [`wait_for_event`](Self::wait_for_event) to block until one of those events arrives.
 #[derive(Debug)]
 pub struct SuspendState {
-    suspended: AtomicBool,
+    state: Mutex<SuspendInner>,
     condvar: Condvar,
-    mutex: Mutex<bool>,
-    frozen_tx: Mutex<Option<mpsc::SyncSender<()>>>,
+}
+
+impl std::fmt::Debug for SuspendInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SuspendInner")
+            .field("suspended", &self.suspended)
+            .field("parked", &self.parked)
+            .field("finished", &self.finished)
+            .finish()
+    }
 }
 
 impl SuspendState {
     pub fn new() -> Self {
         SuspendState {
-            suspended: AtomicBool::new(false),
+            state: Mutex::new(SuspendInner {
+                suspended: false,
+                parked: false,
+                finished: false,
+            }),
             condvar: Condvar::new(),
-            mutex: Mutex::new(false),
-            frozen_tx: Mutex::new(None),
         }
     }
 
     /// Signal that threads should suspend at their next yield point.
     pub fn suspend(&self) {
-        self.suspended.store(true, Ordering::SeqCst);
+        self.state.lock().expect("suspend state mutex").suspended = true;
     }
 
-    /// Resume suspended threads.
+    /// Resume suspended threads and clear the parked flag.
     pub fn resume(&self) {
-        // Hold the mutex while setting `suspended` and notifying.
-        // This prevents a lost-wakeup where `notify_all` fires before the worker
-        // has entered `condvar.wait`, leaving the worker stuck indefinitely.
-        let _guard = self.mutex.lock().expect("suspend mutex");
-        self.suspended.store(false, Ordering::SeqCst);
+        let mut s = self.state.lock().expect("suspend state mutex");
+        s.suspended = false;
+        s.parked = false;
         self.condvar.notify_all();
     }
 
     /// Returns whether the pipeline is currently requested to suspend.
     pub fn is_suspended(&self) -> bool {
-        self.suspended.load(Ordering::SeqCst)
+        self.state.lock().expect("suspend state mutex").suspended
     }
 
-    /// Register a channel to notify the orchestrator when the worker parks.
-    pub fn set_frozen_notifier(&self, tx: mpsc::SyncSender<()>) {
-        *self.frozen_tx.lock().expect("frozen_tx lock") = Some(tx);
+    /// Called by the worker thread just before it returns, to notify the orchestrator.
+    pub fn mark_finished(&self) {
+        self.state.lock().expect("suspend state mutex").finished = true;
+        self.condvar.notify_all();
     }
 
-    /// Cooperative yield point. Blocks if suspended; returns immediately otherwise.
-    ///
-    /// When the thread parks, it sends the "parked" notification while holding the condvar
-    /// mutex, then atomically releases the mutex and enters `condvar.wait`. Sending inside
-    /// the mutex guarantees that [`resume`](Self::resume) cannot fire `notify_all` before
-    /// the worker is actually waiting, eliminating the lost-wakeup race.
+    /// Cooperative yield point. Blocks the worker if suspended; returns immediately otherwise.
     pub fn wait_if_suspended(&self) {
-        // Fast path: avoid locking if not suspended.
-        if self.suspended.load(Ordering::SeqCst) {
-            let mut guard = self.mutex.lock().expect("suspend mutex");
-            // Re-check inside the mutex to close the TOCTOU window between the fast-path
-            // load and acquiring the lock.
-            if self.suspended.load(Ordering::SeqCst) {
-                // Notify the orchestrator while holding the mutex.  This ensures resume()
-                // cannot set suspended=false and fire notify_all before we enter condvar.wait.
-                if let Some(tx) = self.frozen_tx.lock().expect("frozen_tx lock").as_ref() {
-                    let _ = tx.try_send(());
-                }
-                while self.suspended.load(Ordering::SeqCst) {
-                    guard = self.condvar.wait(guard).expect("condvar wait");
-                }
+        let mut guard = self.state.lock().expect("suspend state mutex");
+        if guard.suspended {
+            guard.parked = true;
+            self.condvar.notify_all();
+            drop(
+                self.condvar
+                    .wait_while(guard, |s| s.suspended)
+                    .expect("condvar wait"),
+            );
+        }
+    }
+
+    /// Block until the worker finishes, parks, or the timeout elapses.
+    ///
+    /// Pass `None` to block indefinitely. Spurious wakeups are handled internally.
+    pub fn wait_for_event(&self, timeout: Option<Duration>) -> SuspendEvent {
+        let guard = self.state.lock().expect("suspend state mutex");
+        if guard.finished {
+            return SuspendEvent::Finished;
+        }
+        if guard.parked {
+            return SuspendEvent::Parked;
+        }
+        if let Some(dur) = timeout {
+            let (guard, result) = self
+                .condvar
+                .wait_timeout_while(guard, dur, |s| !s.finished && !s.parked)
+                .expect("condvar wait");
+            if result.timed_out() {
+                SuspendEvent::Timeout
+            } else if guard.finished {
+                SuspendEvent::Finished
+            } else {
+                SuspendEvent::Parked
+            }
+        } else {
+            let guard = self
+                .condvar
+                .wait_while(guard, |s| !s.finished && !s.parked)
+                .expect("condvar wait");
+            if guard.finished {
+                SuspendEvent::Finished
+            } else {
+                SuspendEvent::Parked
             }
         }
     }
@@ -278,30 +328,31 @@ impl UnfreezeHandle {
         }
     }
 
-    pub fn pid(&self) -> u32 {
+    pub fn pid(&self) -> Option<u32> {
         match self {
             #[cfg(unix)]
-            UnfreezeHandle::Process { child_pid } => child_pid.as_raw() as u32,
+            UnfreezeHandle::Process { child_pid } => Some(child_pid.as_raw() as u32),
             #[cfg(not(unix))]
-            UnfreezeHandle::Process { .. } => 0,
-            UnfreezeHandle::Thread { .. } => 0,
+            UnfreezeHandle::Process { .. } => None,
+            UnfreezeHandle::Thread { .. } => None,
         }
     }
 
-    pub fn kill(&self) {
+    pub fn kill(&self) -> io::Result<()> {
         match self {
             #[cfg(unix)]
             UnfreezeHandle::Process { child_pid } => {
-                let _ = signal::killpg(*child_pid, signal::SIGKILL);
+                signal::killpg(*child_pid, signal::SIGKILL).map_err(Into::into)
             }
             #[cfg(not(unix))]
-            UnfreezeHandle::Process { .. } => {}
+            UnfreezeHandle::Process { .. } => Ok(()),
             UnfreezeHandle::Thread {
                 interrupt,
                 suspend_state,
             } => {
                 interrupt.store(true, Ordering::SeqCst);
-                suspend_state.resume(); // wake thread so it can observe the interrupt
+                suspend_state.resume();
+                Ok(())
             }
         }
     }

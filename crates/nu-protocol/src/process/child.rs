@@ -267,7 +267,7 @@ impl PostWaitCallback {
                 let job_id = jobs.add_job(Job::Frozen(FrozenJob {
                     unfreeze,
                     description,
-                    pipeline_state: None,
+                    command_thread: None,
                 }));
 
                 if is_interactive {

@@ -1,16 +1,13 @@
-use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32},
-        mpsc,
-    },
-    thread,
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU32},
+    mpsc,
 };
 
-use nu_engine::{ClosureEvalOnce, command_prelude::*};
+use nu_engine::{ClosureEvalOnce, command_prelude::*, spawn_with};
 use nu_protocol::{
-    OutDest, Signals,
-    engine::{Closure, CurrentJob, Job, Mailbox, Redirection, ThreadJob},
+    OutDest, ShellError, Signals,
+    engine::{Closure, CurrentJob, Job, Mailbox, Redirection, Stack, ThreadJob},
     report_shell_error,
 };
 
@@ -65,7 +62,7 @@ impl Command for JobSpawn {
         job_state.is_interactive = false;
 
         // the new job should have its ctrl-c independent of foreground
-        let job_signals = Signals::new(Arc::new(AtomicBool::new(false)));
+        let job_signals = Signals::new(Arc::new(AtomicBool::new(false)), None);
         job_state.set_signals(job_signals.clone());
 
         // the new job has a separate process group state for its processes
@@ -73,61 +70,46 @@ impl Command for JobSpawn {
 
         job_state.exit_warning_given = Arc::new(AtomicBool::new(false));
 
-        let jobs = job_state.jobs.clone();
-        let mut jobs = jobs.lock().expect("jobs lock is poisoned!");
-
         let (send, recv) = mpsc::channel();
 
         let id = {
+            let mut jobs = job_state.jobs.lock().expect("jobs lock is poisoned!");
             let thread_job = ThreadJob::new(job_signals, description, send);
-
             let id = jobs.add_job(Job::Thread(thread_job.clone()));
-
             job_state.current_job = CurrentJob {
                 id,
                 background_thread_job: Some(thread_job),
                 mailbox: Arc::new(Mutex::new(Mailbox::new(recv))),
             };
-
             id
+            // jobs lock released here, before the thread is spawned
         };
 
-        let result = thread::Builder::new()
-            .name(format!("background job {}", id.get()))
-            .spawn(move || {
-                let mut stack = job_stack.reset_pipes();
-                let stack = stack.push_redirection(
-                    Some(Redirection::Pipe(OutDest::Null)),
-                    Some(Redirection::Pipe(OutDest::Null)),
-                );
-                ClosureEvalOnce::new_preserve_out_dest(&job_state, &stack, closure)
-                    .run_with_input(Value::nothing(head).into_pipeline_data())
-                    .and_then(|data| data.drain())
-                    .unwrap_or_else(|err| {
-                        if !job_state.signals().interrupted() {
-                            report_shell_error(None, &job_state, &err);
-                        }
-                    });
+        spawn_with(&job_state, move |worker_es| {
+            let mut stack = job_stack.reset_pipes();
+            let stack = stack.push_redirection(
+                Some(Redirection::Pipe(OutDest::Null)),
+                Some(Redirection::Pipe(OutDest::Null)),
+            );
+            ClosureEvalOnce::new_preserve_out_dest(worker_es, &stack, closure)
+                .run_with_input(Value::nothing(head).into_pipeline_data())
+                .and_then(|data| data.drain())
+                .unwrap_or_else(|err| {
+                    if !worker_es.signals().interrupted() {
+                        report_shell_error(None, worker_es, &err);
+                    }
+                });
 
-                {
-                    let mut jobs = job_state.jobs.lock().expect("jobs lock is poisoned!");
-
-                    jobs.remove_job(id);
-                }
-            });
-
-        match result {
-            Ok(_) => Ok(Value::int(id.get() as i64, head).into_pipeline_data()),
-            Err(err) => {
+            {
+                let mut jobs = worker_es.jobs.lock().expect("jobs lock is poisoned!");
                 jobs.remove_job(id);
-                Err(ShellError::Io(IoError::new_with_additional_context(
-                    err,
-                    call.head,
-                    None,
-                    "Failed to spawn thread for job",
-                )))
             }
-        }
+
+            Ok(Stack::new())
+        })
+        .detach();
+
+        Ok(Value::int(id.get() as i64, head).into_pipeline_data())
     }
 
     fn examples(&self) -> Vec<Example<'_>> {

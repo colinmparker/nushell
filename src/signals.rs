@@ -6,7 +6,7 @@ use std::sync::{
 
 pub(crate) fn ctrlc_protection(engine_state: &mut EngineState) {
     let interrupt = Arc::new(AtomicBool::new(false));
-    engine_state.set_signals(Signals::new(interrupt.clone()));
+    engine_state.set_signals(Signals::new(interrupt.clone(), None));
 
     let signal_handlers = Handlers::new();
 

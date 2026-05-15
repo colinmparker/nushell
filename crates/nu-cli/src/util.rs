@@ -1,9 +1,9 @@
 #![allow(clippy::byte_char_slices)]
 
 use nu_cmd_base::hook::eval_hook;
-#[cfg(unix)]
-use nu_engine::{CommandThread, is_on_command_thread, orchestrate_command_thread};
 use nu_engine::{eval_block, eval_block_with_early_return};
+#[cfg(unix)]
+use nu_engine::{foreground_command_thread, spawn_with};
 use nu_parser::{Token, TokenContents, lex, parse, unescape_unquote_string};
 #[cfg(unix)]
 use nu_protocol::ast::Block;
@@ -283,14 +283,17 @@ pub fn eval_source(
     exit_code
 }
 
-/// Evaluate `block` + print its output on a single worker thread with cooperative Ctrl+Z support.
-///
-/// The worker runs with suspend-aware [`Signals`], so every `signals.check()` call anywhere in
-/// the pipeline — including inside `sleep`, `each` closures, and consuming commands — is a
-/// cooperative freeze point. On Ctrl+Z the worker parks on a condvar; `job unfreeze` resumes it.
-///
-/// The worker sends its final [`Stack`] back so env var assignments and other mutations are
-/// visible to the REPL after the pipeline completes.
+/// Apply any variable deletions recorded in `stack` back to the shared `engine_state`.
+fn apply_stack_deletions(engine_state: &mut EngineState, stack: &Stack) {
+    for var_id in &stack.deletions {
+        if let Some(active_id) = engine_state.scope.active_overlays.last()
+            && let Some((_, overlay)) = engine_state.scope.overlays.get_mut((*active_id).get())
+        {
+            overlay.vars.retain(|_, v| *v != *var_id);
+        }
+    }
+}
+
 #[cfg(unix)]
 fn evaluate_source_threaded(
     engine_state: &mut EngineState,
@@ -302,13 +305,12 @@ fn evaluate_source_threaded(
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    // Clear any stale SIGTSTP from a previous pipeline before starting.
     SIGTSTP_FLAG.store(false, Ordering::SeqCst);
 
     let block_arc = Arc::new(block.clone());
     let mut worker_stack = stack.clone();
 
-    let ct = CommandThread::spawn_with(engine_state, move |worker_es| {
+    let ct = spawn_with(engine_state, move |worker_es| {
         let ped = eval_block::<WithoutDebug>(worker_es, &mut worker_stack, &block_arc, input)?;
         let pipeline_data = ped.body;
         let exit_status = ped.exit;
@@ -323,24 +325,13 @@ fn evaluate_source_threaded(
         Ok(worker_stack)
     });
 
-    match orchestrate_command_thread(engine_state, ct)? {
+    match foreground_command_thread(engine_state, ct)? {
         Some(worker_stack) => {
-            // Apply the worker's variable deletions to the shared engine_state.
-            for var_id in &worker_stack.deletions {
-                if let Some(active_id) = engine_state.scope.active_overlays.last()
-                    && let Some((_, overlay)) =
-                        engine_state.scope.overlays.get_mut((*active_id).get())
-                {
-                    overlay.vars.retain(|_, v| *v != *var_id);
-                }
-            }
-            // Replace the caller's stack with the worker's final stack so env var
-            // assignments and other mutations from the pipeline are visible in the REPL.
+            apply_stack_deletions(engine_state, &worker_stack);
             *stack = worker_stack;
             stack.deletions.clear();
             Ok(false)
         }
-        // Pipeline was frozen or interrupted — nothing more to do.
         None => Ok(false),
     }
 }
@@ -380,20 +371,16 @@ fn evaluate_source(
 
     engine_state.merge_delta(delta)?;
 
-    // For interactive Unix sessions, dispatch to a single worker thread that runs both eval and
-    // print. This gives cooperative Ctrl+Z freeze support for the entire pipeline lifetime,
-    // including inside sleep, each closures, and consuming commands like sort-by and save.
     #[cfg(unix)]
     if !allow_return
         && engine_state.is_interactive
         && !engine_state.is_background_job()
-        && !is_on_command_thread()
+        && !engine_state.is_command_thread
         && !block.pipelines.is_empty()
     {
         return evaluate_source_threaded(engine_state, stack, &block, input);
     }
 
-    // Synchronous path: sourced files, non-interactive mode, Windows, background jobs.
     let pipeline = if allow_return {
         eval_block_with_early_return::<WithoutDebug>(engine_state, stack, &block, input)?
     } else {
@@ -401,14 +388,7 @@ fn evaluate_source(
     };
     let pipeline_data = pipeline.body;
 
-    // Update engine_state with deleted variables.
-    for var_id in &stack.deletions {
-        if let Some(active_id) = engine_state.scope.active_overlays.last()
-            && let Some((_, overlay)) = engine_state.scope.overlays.get_mut((*active_id).get())
-        {
-            overlay.vars.retain(|_, v| *v != *var_id);
-        }
-    }
+    apply_stack_deletions(engine_state, stack);
     stack.deletions.clear();
 
     let no_newline = matches!(&pipeline_data, &PipelineData::ByteStream(..));

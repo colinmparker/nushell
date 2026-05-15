@@ -3,7 +3,6 @@ mod call_ext;
 mod closure_eval;
 pub mod column;
 pub mod command_prelude;
-#[cfg(unix)]
 mod command_thread;
 mod compile;
 pub mod documentation;
@@ -18,13 +17,12 @@ pub mod scope;
 pub use call_ext::CallExt;
 pub use closure_eval::*;
 pub use column::get_columns;
-#[cfg(unix)]
-pub use command_thread::{CommandThread, FrozenCommandThreadState, is_on_command_thread};
+pub use command_thread::spawn_with;
 pub use compile::compile;
 pub use documentation::get_full_help;
 pub use env::*;
 #[cfg(unix)]
-pub use eval::orchestrate_command_thread;
+pub use eval::foreground_command_thread;
 pub use eval::{
     eval_block, eval_block_with_early_return, eval_call, eval_expression,
     eval_expression_with_input, eval_subexpression, eval_variable, redirect_env,

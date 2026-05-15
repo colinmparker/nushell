@@ -129,7 +129,7 @@ impl EngineInterfaceManager {
                 stream_id_sequence: Sequence::default(),
                 engine_call_subscription_sender: subscription_tx,
                 writer: Box::new(writer),
-                signals: Signals::new(Arc::new(AtomicBool::new(false))),
+                signals: Signals::new(Arc::new(AtomicBool::new(false)), None),
                 signal_handlers: Handlers::new(),
             }),
             protocol_info_mut,

@@ -1,5 +1,4 @@
 use std::{
-    any::Any,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{
         Arc, Mutex,
@@ -15,6 +14,8 @@ use std::time::Duration;
 use nu_system::{UnfreezeHandle, kill_by_pid};
 
 use crate::{PipelineData, Signals, shell_error};
+
+use super::CommandThread;
 
 use crate::JobId;
 
@@ -235,12 +236,7 @@ impl Job {
 pub struct FrozenJob {
     pub unfreeze: UnfreezeHandle,
     pub description: Option<String>,
-    /// Opaque pipeline state (e.g. `FrozenCommandThreadState`) carried across freeze/resume cycles.
-    ///
-    /// Stored as `Box<dyn Any + Send>` to avoid a dependency cycle: `nu-protocol` cannot
-    /// depend on `nu-engine`, so the concrete type is downcast at the call site in
-    /// `nu-command`'s `job unfreeze`.
-    pub pipeline_state: Option<Box<dyn Any + Send>>,
+    pub command_thread: Option<CommandThread>,
 }
 
 impl std::fmt::Debug for FrozenJob {
@@ -248,18 +244,13 @@ impl std::fmt::Debug for FrozenJob {
         f.debug_struct("FrozenJob")
             .field("unfreeze", &self.unfreeze)
             .field("description", &self.description)
-            .field(
-                "pipeline_state",
-                &self.pipeline_state.as_ref().map(|_| "<opaque>"),
-            )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl FrozenJob {
     pub fn kill(&self) -> shell_error::io::Result<()> {
-        self.unfreeze.kill();
-        Ok(())
+        self.unfreeze.kill().map_err(Into::into)
     }
 }
 
