@@ -173,5 +173,8 @@ fn unfreeze_thread_job(
 
     ct.suspend_state.resume();
     foreground_command_thread(engine_state, ct)?;
+    // Clear any suspension the outer orchestrator placed on this worker thread
+    // while the inner orchestrator was running, preventing a spurious second freeze.
+    engine_state.signals().resume();
     Ok(PipelineData::Empty)
 }

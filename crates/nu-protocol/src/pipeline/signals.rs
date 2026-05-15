@@ -106,11 +106,19 @@ impl Signals {
 
     /// Cooperative yield point. Blocks the calling thread if a suspend has been requested;
     /// returns immediately otherwise. No-op if this `Signals` has no suspend state.
+    ///
+    /// On Unix, also checks `SIGTSTP_FLAG` directly so that command-thread workers can
+    /// self-suspend at yield points without waiting for the orchestrator's polling interval.
     #[inline]
     pub fn wait_if_suspended(&self) {
         if let Some(inner) = &self.inner
             && let Some(s) = &inner.suspend
         {
+            #[cfg(unix)]
+            if nu_system::SIGTSTP_FLAG.load(std::sync::atomic::Ordering::SeqCst) {
+                s.suspend();
+            }
+
             s.wait_if_suspended();
         }
     }
@@ -121,6 +129,31 @@ impl Signals {
     /// and the pipeline worker thread.
     pub fn interrupt_arc(&self) -> Option<Arc<AtomicBool>> {
         self.inner.as_ref().map(|i| i.interrupt.clone())
+    }
+
+    /// Request the thread to park at its next yield point.
+    ///
+    /// No-op if this `Signals` has no suspend state (e.g., background jobs or the REPL).
+    pub fn suspend(&self) {
+        if let Some(inner) = &self.inner
+            && let Some(s) = &inner.suspend
+        {
+            s.suspend();
+        }
+    }
+
+    /// Clear any pending suspension request so the thread will not park at the next yield point.
+    ///
+    /// Used after a nested orchestrator returns to ensure that a suspension flag set by an outer
+    /// orchestrator does not unexpectedly park this thread later.
+    ///
+    /// No-op if this `Signals` has no suspend state.
+    pub fn resume(&self) {
+        if let Some(inner) = &self.inner
+            && let Some(s) = &inner.suspend
+        {
+            s.resume();
+        }
     }
 }
 

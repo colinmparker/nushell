@@ -504,45 +504,39 @@ pub fn foreground_command_thread(
     engine_state: &EngineState,
     ct: nu_protocol::engine::CommandThread,
 ) -> Result<Option<Stack>, ShellError> {
-    use nu_protocol::engine::{FrozenJob, Job};
-    use nu_system::{SIGTSTP_FLAG, SuspendEvent, UnfreezeHandle};
+    use nu_system::{SIGTSTP_FLAG, SuspendEvent};
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     loop {
-        // Block until the worker finishes or 100ms elapses (to poll signal flags).
+        // Block until the worker finishes, parks, or 100ms elapses (to poll signal flags).
         match ct
             .suspend_state
             .wait_for_event(Some(Duration::from_millis(100)))
         {
             SuspendEvent::Finished => return ct.join().map(Some),
-            SuspendEvent::Parked => unreachable!("worker parked without suspend request"),
+            SuspendEvent::Parked => {
+                // The worker parked itself because an external child was frozen and
+                // PostWaitCallback signaled it to suspend. Clear the flag and register
+                // a frozen job for the worker thread.
+                SIGTSTP_FLAG.store(false, Ordering::SeqCst);
+                return freeze_command_thread(engine_state, ct);
+            }
             SuspendEvent::Timeout => {}
         }
 
         // Check for Ctrl+Z (SIGTSTP) — freeze the pipeline.
-        if SIGTSTP_FLAG.swap(false, Ordering::SeqCst) {
+        // Use load() so the flag persists until we actually create a FrozenJob;
+        // this avoids racing with concurrent reads (e.g. workers checking the flag
+        // at yield points via wait_if_suspended).
+        if SIGTSTP_FLAG.load(Ordering::SeqCst) {
             ct.suspend();
 
             // Block until the worker parks or finishes before creating the FrozenJob.
             match ct.suspend_state.wait_for_event(None) {
                 SuspendEvent::Parked => {
-                    let suspend_state = ct.suspend_state.clone();
-                    let interrupt = ct.interrupt.clone();
-                    let handle = UnfreezeHandle::Thread {
-                        suspend_state,
-                        interrupt,
-                    };
-                    let job = Job::Frozen(FrozenJob {
-                        unfreeze: handle,
-                        description: Some("pipeline".into()),
-                        command_thread: Some(ct),
-                    });
-                    let job_id = engine_state.jobs.lock().expect("jobs lock").add_job(job);
-                    if engine_state.is_interactive {
-                        eprintln!("\nJob {} is frozen", job_id.get());
-                    }
-                    return Ok(None);
+                    SIGTSTP_FLAG.store(false, Ordering::SeqCst);
+                    return freeze_command_thread(engine_state, ct);
                 }
                 SuspendEvent::Finished => return ct.join().map(Some),
                 SuspendEvent::Timeout => unreachable!(),
@@ -562,6 +556,36 @@ pub fn foreground_command_thread(
             }
         }
     }
+}
+
+/// Register a [`FrozenJob`] for a parked command thread worker and return `Ok(None)`.
+///
+/// The caller must ensure that `ct` is already parked (i.e., the worker called
+/// `wait_if_suspended` and is blocked).  The job is resumed by `job unfreeze`.
+#[cfg(unix)]
+fn freeze_command_thread(
+    engine_state: &EngineState,
+    ct: nu_protocol::engine::CommandThread,
+) -> Result<Option<Stack>, ShellError> {
+    use nu_protocol::engine::{FrozenJob, Job};
+    use nu_system::UnfreezeHandle;
+
+    let suspend_state = ct.suspend_state.clone();
+    let interrupt = ct.interrupt.clone();
+    let handle = UnfreezeHandle::Thread {
+        suspend_state,
+        interrupt,
+    };
+    let job = Job::Frozen(FrozenJob {
+        unfreeze: handle,
+        description: Some("pipeline".into()),
+        command_thread: Some(ct),
+    });
+    let job_id = engine_state.jobs.lock().expect("jobs lock").add_job(job);
+    if engine_state.is_interactive {
+        eprintln!("\nJob {} is frozen", job_id.get());
+    }
+    Ok(None)
 }
 
 pub fn eval_block_with_early_return<D: DebugContext>(

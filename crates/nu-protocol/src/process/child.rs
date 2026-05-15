@@ -255,6 +255,10 @@ impl PostWaitCallback {
         let this_job = engine_state.current_thread_job().cloned();
         let jobs = engine_state.jobs.clone();
         let is_interactive = engine_state.is_interactive;
+        // Capture the worker's signals so we can ask it to park when an external
+        // child is frozen. If this is not a command thread (no suspend state), this
+        // is a no-op.
+        let signals = engine_state.signals().clone();
 
         PostWaitCallback::new(move |status| {
             if let (Some(this_job), Some(child_pid)) = (this_job, child_pid) {
@@ -273,6 +277,12 @@ impl PostWaitCallback {
                 if is_interactive {
                     println!("\nJob {} is frozen", job_id.get());
                 }
+
+                // Tell the worker thread to park at its next yield point so the
+                // orchestrator (foreground_command_thread) can also create a frozen
+                // job for the pipeline. Without this, the worker continues to the
+                // next iteration and a second Ctrl-Z is required to stop it.
+                signals.suspend();
             }
         })
     }
