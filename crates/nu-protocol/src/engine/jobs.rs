@@ -15,6 +15,8 @@ use nu_system::{UnfreezeHandle, kill_by_pid};
 
 use crate::{PipelineData, Signals, shell_error};
 
+use super::CommandThread;
+
 use crate::JobId;
 
 #[derive(Debug)]
@@ -231,24 +233,24 @@ impl Job {
     }
 }
 
-#[derive(Debug)]
 pub struct FrozenJob {
     pub unfreeze: UnfreezeHandle,
     pub description: Option<String>,
+    pub command_thread: Option<CommandThread>,
+}
+
+impl std::fmt::Debug for FrozenJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrozenJob")
+            .field("unfreeze", &self.unfreeze)
+            .field("description", &self.description)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FrozenJob {
     pub fn kill(&self) -> shell_error::io::Result<()> {
-        #[cfg(unix)]
-        {
-            Ok(kill_by_pid(self.unfreeze.pid() as i64)?)
-        }
-
-        // it doesn't happen outside unix.
-        #[cfg(not(unix))]
-        {
-            Ok(())
-        }
+        self.unfreeze.kill().map_err(Into::into)
     }
 }
 

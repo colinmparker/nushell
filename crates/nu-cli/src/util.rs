@@ -2,7 +2,11 @@
 
 use nu_cmd_base::hook::eval_hook;
 use nu_engine::{eval_block, eval_block_with_early_return};
+#[cfg(unix)]
+use nu_engine::{foreground_command_thread, spawn_with};
 use nu_parser::{Token, TokenContents, lex, parse, unescape_unquote_string};
+#[cfg(unix)]
+use nu_protocol::ast::Block;
 use nu_protocol::{
     PipelineData, ShellError, Span, Value,
     debugger::WithoutDebug,
@@ -279,6 +283,59 @@ pub fn eval_source(
     exit_code
 }
 
+/// Apply any variable deletions recorded in `stack` back to the shared `engine_state`.
+fn apply_stack_deletions(engine_state: &mut EngineState, stack: &Stack) {
+    for var_id in &stack.deletions {
+        if let Some(active_id) = engine_state.scope.active_overlays.last()
+            && let Some((_, overlay)) = engine_state.scope.overlays.get_mut((*active_id).get())
+        {
+            overlay.vars.retain(|_, v| *v != *var_id);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn evaluate_source_threaded(
+    engine_state: &mut EngineState,
+    stack: &mut Stack,
+    block: &Block,
+    input: PipelineData,
+) -> Result<bool, ShellError> {
+    use nu_system::SIGTSTP_FLAG;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    SIGTSTP_FLAG.store(false, Ordering::SeqCst);
+
+    let block_arc = Arc::new(block.clone());
+    let mut worker_stack = stack.clone();
+
+    let ct = spawn_with(engine_state, move |worker_es| {
+        let ped = eval_block::<WithoutDebug>(worker_es, &mut worker_stack, &block_arc, input)?;
+        let pipeline_data = ped.body;
+        let exit_status = ped.exit;
+
+        let no_newline = matches!(&pipeline_data, &PipelineData::ByteStream(..));
+        print_pipeline(worker_es, &mut worker_stack, pipeline_data, no_newline)?;
+
+        if nu_experimental::PIPE_FAIL.get() {
+            check_exit_status_future(exit_status)?;
+        }
+
+        Ok(worker_stack)
+    });
+
+    match foreground_command_thread(engine_state, ct)? {
+        Some(worker_stack) => {
+            apply_stack_deletions(engine_state, &worker_stack);
+            *stack = worker_stack;
+            stack.deletions.clear();
+            Ok(false)
+        }
+        None => Ok(false),
+    }
+}
+
 fn evaluate_source(
     engine_state: &mut EngineState,
     stack: &mut Stack,
@@ -314,21 +371,24 @@ fn evaluate_source(
 
     engine_state.merge_delta(delta)?;
 
+    #[cfg(unix)]
+    if !allow_return
+        && engine_state.is_interactive
+        && !engine_state.is_background_job()
+        && !engine_state.is_command_thread
+        && !block.pipelines.is_empty()
+    {
+        return evaluate_source_threaded(engine_state, stack, &block, input);
+    }
+
     let pipeline = if allow_return {
-        eval_block_with_early_return::<WithoutDebug>(engine_state, stack, &block, input)
+        eval_block_with_early_return::<WithoutDebug>(engine_state, stack, &block, input)?
     } else {
-        eval_block::<WithoutDebug>(engine_state, stack, &block, input)
-    }?;
+        eval_block::<WithoutDebug>(engine_state, stack, &block, input)?
+    };
     let pipeline_data = pipeline.body;
 
-    // Update engine_state with deleted variables
-    for var_id in &stack.deletions {
-        if let Some(active_id) = engine_state.scope.active_overlays.last()
-            && let Some((_, overlay)) = engine_state.scope.overlays.get_mut((*active_id).get())
-        {
-            overlay.vars.retain(|_, v| *v != *var_id);
-        }
-    }
+    apply_stack_deletions(engine_state, stack);
     stack.deletions.clear();
 
     let no_newline = matches!(&pipeline_data, &PipelineData::ByteStream(..));

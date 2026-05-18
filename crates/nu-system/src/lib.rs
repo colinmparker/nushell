@@ -11,6 +11,16 @@ mod exit_status;
 mod foreground;
 mod util;
 
+#[cfg(unix)]
+use std::sync::atomic::AtomicBool;
+
+/// Set to `true` by the SIGTSTP (Ctrl+Z) signal handler when the user suspends a pipeline.
+///
+/// The pipeline orchestrator in `nu-engine` polls this flag in its wait loop. On detection,
+/// it cooperatively suspends the pipeline thread and registers a frozen job.
+#[cfg(unix)]
+pub static SIGTSTP_FLAG: AtomicBool = AtomicBool::new(false);
+
 #[cfg(target_os = "freebsd")]
 mod freebsd;
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -31,6 +41,8 @@ pub use self::foreground::stdin_fd;
 pub use self::foreground::{
     ForegroundChild, ForegroundGuard, ForegroundWaitStatus, UnfreezeHandle,
 };
+#[cfg(unix)]
+pub use self::foreground::{SuspendEvent, SuspendState};
 
 pub use self::util::*;
 

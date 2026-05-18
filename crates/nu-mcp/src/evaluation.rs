@@ -243,7 +243,7 @@ impl EvalState {
     /// is an `Arc<AtomicBool>` that can be set to `true` to interrupt the evaluation.
     fn fork(&self) -> (Self, Arc<AtomicBool>) {
         let interrupt = Arc::new(AtomicBool::new(false));
-        let signals = Signals::new(interrupt.clone());
+        let signals = Signals::new(interrupt.clone(), None);
 
         let mut engine_state = self.engine_state.clone();
         engine_state.set_signals(signals);
@@ -489,7 +489,7 @@ fn promote_to_background_job(
     root_job_sender: Sender<Mail>,
     description: String,
 ) -> Result<String, rmcp::ErrorData> {
-    let signals = Signals::new(interrupt);
+    let signals = Signals::new(interrupt, None);
     let (sender, _receiver) = mpsc::channel();
     let thread_job = ThreadJob::new(signals, Some(description), sender);
 

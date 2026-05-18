@@ -1,10 +1,10 @@
-use nu_engine::command_prelude::*;
+use nu_engine::{command_prelude::*, foreground_command_thread};
 use nu_protocol::{
     JobId,
-    engine::{FrozenJob, Job, ThreadJob},
+    engine::{CommandThread, FrozenJob, Job, ThreadJob},
     process::check_ok,
 };
-use nu_system::{ForegroundWaitStatus, kill_by_pid};
+use nu_system::{ForegroundWaitStatus, UnfreezeHandle, kill_by_pid};
 
 #[derive(Clone)]
 pub struct JobUnfreeze;
@@ -22,7 +22,7 @@ impl Command for JobUnfreeze {
         Signature::build("job unfreeze")
             .category(Category::Experimental)
             .optional("id", SyntaxShape::Int, "The process id to unfreeze.")
-            .input_output_types(vec![(Type::Nothing, Type::Nothing)])
+            .input_output_types(vec![(Type::Nothing, Type::Any)])
             .allow_variants_without_examples(true)
     }
 
@@ -59,9 +59,7 @@ impl Command for JobUnfreeze {
 
         drop(jobs);
 
-        unfreeze_job(engine_state, id, job, head)?;
-
-        Ok(Value::nothing(head).into_pipeline_data())
+        unfreeze_job(engine_state, id, job, head)
     }
 
     fn examples(&self) -> Vec<Example<'_>> {
@@ -90,16 +88,24 @@ fn unfreeze_job(
     old_id: JobId,
     job: Job,
     span: Span,
-) -> Result<(), ShellError> {
+) -> Result<PipelineData, ShellError> {
     match job {
         Job::Thread(ThreadJob { .. }) => Err(JobError::CannotUnfreeze { span, id: old_id }.into()),
         Job::Frozen(FrozenJob {
             unfreeze: handle,
             description,
+            command_thread,
         }) => {
+            #[cfg(unix)]
+            if let UnfreezeHandle::Thread { .. } = &handle {
+                return unfreeze_thread_job(state, command_thread);
+            }
+
+            // External process job.
             let pid = handle.pid();
 
-            if let Some(thread_job) = &state.current_thread_job()
+            if let Some(pid) = pid
+                && let Some(thread_job) = &state.current_thread_job()
                 && !thread_job.try_add_pid(pid)
             {
                 kill_by_pid(pid.into()).map_err(|err| {
@@ -116,7 +122,9 @@ fn unfreeze_job(
                     .then(|| state.pipeline_externals_state.clone()),
             );
 
-            if let Some(thread_job) = &state.current_thread_job() {
+            if let Some(pid) = pid
+                && let Some(thread_job) = &state.current_thread_job()
+            {
                 thread_job.remove_pid(pid);
             }
 
@@ -129,6 +137,7 @@ fn unfreeze_job(
                         Job::Frozen(FrozenJob {
                             unfreeze: handle,
                             description,
+                            command_thread: None,
                         }),
                     )
                     .expect("job was supposed to be removed");
@@ -136,10 +145,13 @@ fn unfreeze_job(
                     if state.is_interactive {
                         println!("\nJob {} is re-frozen", old_id.get());
                     }
-                    Ok(())
+                    Ok(PipelineData::Empty)
                 }
 
-                Ok(ForegroundWaitStatus::Finished(status)) => check_ok(status, false, span),
+                Ok(ForegroundWaitStatus::Finished(status)) => {
+                    check_ok(status, false, span)?;
+                    Ok(PipelineData::Empty)
+                }
 
                 Err(err) => Err(ShellError::Io(IoError::new_internal(
                     err,
@@ -148,4 +160,21 @@ fn unfreeze_job(
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn unfreeze_thread_job(
+    engine_state: &EngineState,
+    command_thread: Option<CommandThread>,
+) -> Result<PipelineData, ShellError> {
+    let Some(ct) = command_thread else {
+        return Ok(PipelineData::Empty);
+    };
+
+    ct.suspend_state.resume();
+    foreground_command_thread(engine_state, ct)?;
+    // Clear any suspension the outer orchestrator placed on this worker thread
+    // while the inner orchestrator was running, preventing a spurious second freeze.
+    engine_state.signals().resume();
+    Ok(PipelineData::Empty)
 }

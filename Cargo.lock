@@ -4435,6 +4435,7 @@ dependencies = [
  "nu-plugin-engine",
  "nu-protocol",
  "nu-std",
+ "nu-system",
  "nu-test-support",
  "nu-utils",
  "nucleo-matcher",
@@ -4677,6 +4678,7 @@ dependencies = [
  "nu-glob",
  "nu-path",
  "nu-protocol",
+ "nu-system",
  "nu-utils",
 ]
 

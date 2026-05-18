@@ -35,6 +35,7 @@ nu-path = { path = "../nu-path", version = "0.112.3" }
 nu-parser = { path = "../nu-parser", version = "0.112.3" }
 nu-plugin-engine = { path = "../nu-plugin-engine", version = "0.112.3", optional = true }
 nu-protocol = { path = "../nu-protocol", version = "0.112.3", features = ["os"] }
+nu-system = { path = "../nu-system", version = "0.112.3" }
 nu-utils = { path = "../nu-utils", version = "0.112.3" }
 nu-color-config = { path = "../nu-color-config", version = "0.112.3" }
 nu-experimental = { path = "../nu-experimental", version = "0.112.3" }
