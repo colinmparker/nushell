@@ -4,6 +4,7 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
+#[cfg(unix)]
 use nu_system::SuspendState;
 
 use crate::{ShellError, engine::Stack};
@@ -13,6 +14,7 @@ use crate::{ShellError, engine::Stack};
 /// Created by `spawn_with` in `nu-engine`. Call [`join`](Self::join) to await the result
 /// or [`detach`](Self::detach) to let the thread run independently.
 pub struct CommandThread {
+    #[cfg(unix)]
     pub suspend_state: Arc<SuspendState>,
     pub interrupt: Arc<AtomicBool>,
     join_handle: Option<JoinHandle<Result<Stack, ShellError>>>,
@@ -26,11 +28,12 @@ impl std::fmt::Debug for CommandThread {
 
 impl CommandThread {
     pub fn new(
-        suspend_state: Arc<SuspendState>,
+        #[cfg(unix)] suspend_state: Arc<SuspendState>,
         interrupt: Arc<AtomicBool>,
         join_handle: JoinHandle<Result<Stack, ShellError>>,
     ) -> Self {
         CommandThread {
+            #[cfg(unix)]
             suspend_state,
             interrupt,
             join_handle: Some(join_handle),
@@ -38,6 +41,7 @@ impl CommandThread {
     }
 
     /// Ask the worker to cooperatively park at its next yield point.
+    #[cfg(unix)]
     pub fn suspend(&self) {
         self.suspend_state.suspend();
     }
@@ -63,6 +67,7 @@ impl CommandThread {
     /// Set the interrupt flag and wake the worker if it is parked.
     pub fn kill(&self) {
         self.interrupt.store(true, Ordering::SeqCst);
+        #[cfg(unix)]
         self.suspend_state.resume();
     }
 }

@@ -1,7 +1,10 @@
 use std::sync::{
-    Arc, Condvar, Mutex,
+    Arc,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
+#[cfg(unix)]
+use std::sync::{Condvar, Mutex};
+#[cfg(unix)]
 use std::time::Duration;
 
 use std::io;
@@ -156,6 +159,7 @@ impl From<std::process::ExitStatus> for ForegroundWaitStatus {
     }
 }
 
+#[cfg(unix)]
 struct SuspendInner {
     suspended: bool,
     parked: bool,
@@ -163,6 +167,7 @@ struct SuspendInner {
 }
 
 /// Events returned by [`SuspendState::wait_for_event`].
+#[cfg(unix)]
 pub enum SuspendEvent {
     /// The worker thread called [`SuspendState::mark_finished`] and has exited.
     Finished,
@@ -177,12 +182,14 @@ pub enum SuspendEvent {
 /// The worker calls [`wait_if_suspended`](Self::wait_if_suspended) at yield points and
 /// [`mark_finished`](Self::mark_finished) on exit. The orchestrator calls
 /// [`wait_for_event`](Self::wait_for_event) to block until one of those events arrives.
+#[cfg(unix)]
 #[derive(Debug)]
 pub struct SuspendState {
     state: Mutex<SuspendInner>,
     condvar: Condvar,
 }
 
+#[cfg(unix)]
 impl std::fmt::Debug for SuspendInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SuspendInner")
@@ -193,6 +200,7 @@ impl std::fmt::Debug for SuspendInner {
     }
 }
 
+#[cfg(unix)]
 impl SuspendState {
     pub fn new() -> Self {
         SuspendState {
@@ -280,6 +288,7 @@ impl SuspendState {
     }
 }
 
+#[cfg(unix)]
 impl Default for SuspendState {
     fn default() -> Self {
         Self::new()
@@ -294,6 +303,7 @@ pub enum UnfreezeHandle {
     },
     /// A frozen internal pipeline (thread-based). The worker thread is parked on the
     /// condvar in `suspend_state` and resumes execution when unparked.
+    #[cfg(unix)]
     Thread {
         suspend_state: Arc<SuspendState>,
         interrupt: Arc<AtomicBool>,
@@ -346,6 +356,7 @@ impl UnfreezeHandle {
             }
             #[cfg(not(unix))]
             UnfreezeHandle::Process { .. } => Ok(()),
+            #[cfg(unix)]
             UnfreezeHandle::Thread {
                 interrupt,
                 suspend_state,

@@ -578,7 +578,7 @@ fn freeze_command_thread(
     };
     let job = Job::Frozen(FrozenJob {
         unfreeze: handle,
-        description: Some("pipeline".into()),
+        description: Some("internal".into()),
         command_thread: Some(ct),
     });
     let job_id = engine_state.jobs.lock().expect("jobs lock").add_job(job);

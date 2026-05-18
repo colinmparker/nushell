@@ -1,5 +1,6 @@
 use crate::{ShellError, Span};
 use nu_glob::Interruptible;
+#[cfg(unix)]
 use nu_system::SuspendState;
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -14,6 +15,7 @@ use std::sync::{
 #[derive(Debug)]
 struct SignalsInner {
     interrupt: Arc<AtomicBool>,
+    #[cfg(unix)]
     suspend: Option<Arc<SuspendState>>,
 }
 
@@ -37,13 +39,22 @@ impl Signals {
     /// Once `ctrlc` is set to `true`, [`check`](Self::check) will error
     /// and [`interrupted`](Self::interrupted) will return `true`.
     ///
-    /// Pass `Some(suspend)` to enable cooperative suspension for pipeline worker threads.
+    /// Pass `Some(suspend)` to enable cooperative suspension for pipeline worker threads
+    /// (Unix only; the parameter is ignored on other platforms).
+    #[cfg(unix)]
     pub fn new(ctrlc: Arc<AtomicBool>, suspend: Option<Arc<SuspendState>>) -> Self {
         Self {
             inner: Some(Arc::new(SignalsInner {
                 interrupt: ctrlc,
                 suspend,
             })),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn new(ctrlc: Arc<AtomicBool>, _suspend: Option<std::convert::Infallible>) -> Self {
+        Self {
+            inner: Some(Arc::new(SignalsInner { interrupt: ctrlc })),
         }
     }
 
@@ -105,16 +116,17 @@ impl Signals {
     }
 
     /// Cooperative yield point. Blocks the calling thread if a suspend has been requested;
-    /// returns immediately otherwise. No-op if this `Signals` has no suspend state.
+    /// returns immediately otherwise. No-op on non-Unix platforms or if this `Signals`
+    /// has no suspend state.
     ///
-    /// On Unix, also checks `SIGTSTP_FLAG` directly so that command-thread workers can
-    /// self-suspend at yield points without waiting for the orchestrator's polling interval.
+    /// Also checks `SIGTSTP_FLAG` directly so that command-thread workers can self-suspend
+    /// at yield points without waiting for the orchestrator's polling interval.
+    #[cfg(unix)]
     #[inline]
     pub fn wait_if_suspended(&self) {
         if let Some(inner) = &self.inner
             && let Some(s) = &inner.suspend
         {
-            #[cfg(unix)]
             if nu_system::SIGTSTP_FLAG.load(std::sync::atomic::Ordering::SeqCst) {
                 s.suspend();
             }
@@ -122,6 +134,10 @@ impl Signals {
             s.wait_if_suspended();
         }
     }
+
+    #[cfg(not(unix))]
+    #[inline]
+    pub fn wait_if_suspended(&self) {}
 
     /// Returns the shared interrupt `Arc<AtomicBool>`, if any.
     ///
@@ -134,6 +150,7 @@ impl Signals {
     /// Request the thread to park at its next yield point.
     ///
     /// No-op if this `Signals` has no suspend state (e.g., background jobs or the REPL).
+    #[cfg(unix)]
     pub fn suspend(&self) {
         if let Some(inner) = &self.inner
             && let Some(s) = &inner.suspend
@@ -148,6 +165,7 @@ impl Signals {
     /// orchestrator does not unexpectedly park this thread later.
     ///
     /// No-op if this `Signals` has no suspend state.
+    #[cfg(unix)]
     pub fn resume(&self) {
         if let Some(inner) = &self.inner
             && let Some(s) = &inner.suspend
